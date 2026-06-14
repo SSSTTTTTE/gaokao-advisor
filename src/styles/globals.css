@@ -1,0 +1,186 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+@plugin "@tailwindcss/typography";
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+  min-height: 100%;
+  background: #f4f4f5;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+}
+
+.gaokao-agent-shell {
+  position: fixed;
+  top: 0;
+  left: 50%;
+  width: 100%;
+  height: 100vh;
+  height: var(--gaokao-layout-height, 100dvh);
+  max-height: var(--gaokao-layout-height, 100dvh);
+  transform: translateX(-50%);
+}
+
+.gaokao-agent-shell > main,
+.gaokao-chat {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.gaokao-chat [data-testid="copilot-input-overlay"] {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--gaokao-keyboard-inset, 0px));
+  z-index: 60;
+  transition: bottom 160ms ease-out;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .gaokao-keyboard-open .gaokao-chat [data-testid="copilot-input-overlay"] {
+    bottom: calc(
+      env(safe-area-inset-bottom, 0px) +
+        max(var(--gaokao-keyboard-inset, 0px), min(42vh, 360px))
+    );
+  }
+
+  .gaokao-mobile-send-fallback {
+    display: flex;
+  }
+
+  .gaokao-keyboard-open .gaokao-mobile-send-fallback {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}
+
+.gaokao-chat [data-testid="copilot-chat-input"] {
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.12);
+}
+
+.gaokao-chat [data-testid="copilot-scroll-content"] {
+  padding-bottom: calc(
+    max(var(--gaokao-chat-bottom-reserve, 184px), 184px) +
+      var(--gaokao-keyboard-inset, 0px)
+  ) !important;
+}
+
+.gaokao-suggestion-bar {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--gaokao-keyboard-inset, 0px) + 116px);
+  left: 50%;
+  max-width: 480px;
+  pointer-events: auto;
+  position: fixed;
+  transform: translateX(-50%);
+  width: 100%;
+  z-index: 58;
+}
+
+.gaokao-chat [data-testid="copilot-chat-textarea"] {
+  font-size: 16px !important;
+  touch-action: manipulation;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.gaokao-chat [data-testid="copilot-send-button"] {
+  min-height: 44px !important;
+  min-width: 44px !important;
+  position: relative;
+  z-index: 70;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.gaokao-mobile-send-fallback {
+  align-items: center;
+  background: #b91c1c;
+  border: 1px solid rgb(127 29 29 / 0.2);
+  border-radius: 999px;
+  bottom: calc(
+    env(safe-area-inset-bottom, 0px) +
+      max(var(--gaokao-keyboard-inset, 0px), min(42vh, 360px)) + 58px
+  );
+  box-shadow: 0 12px 28px rgb(127 29 29 / 0.28);
+  color: #fff;
+  display: none;
+  height: 46px;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  position: fixed;
+  right: max(18px, calc((100vw - 480px) / 2 + 18px));
+  transform: translateY(8px);
+  transition:
+    opacity 120ms ease-out,
+    transform 120ms ease-out;
+  width: 46px;
+  z-index: 120;
+}
+
+.gaokao-mobile-send-fallback:active {
+  transform: translateY(9px) scale(0.97);
+}
+
+.gaokao-chat {
+  --copilot-kit-primary-color: #b91c1c;
+  --copilot-kit-contrast-color: #ffffff;
+}
+
+.gaokao-chat * {
+  letter-spacing: 0;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] strong {
+  color: #991b1b;
+  font-weight: 750;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  border: 0 !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  overflow: visible;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] thead {
+  display: none;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] tbody,
+.gaokao-chat [data-testid="copilot-assistant-message"] tr,
+.gaokao-chat [data-testid="copilot-assistant-message"] th,
+.gaokao-chat [data-testid="copilot-assistant-message"] td {
+  display: block;
+  width: 100%;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] tr {
+  margin: 0.5rem 0;
+  overflow: hidden;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 0.5rem;
+  background: #fff;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] th,
+.gaokao-chat [data-testid="copilot-assistant-message"] td {
+  border: 0 !important;
+  border-bottom: 1px solid #f4f4f5 !important;
+  padding: 0.5rem 0.65rem !important;
+  word-break: break-word;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] tr > :last-child {
+  border-bottom: 0 !important;
+}

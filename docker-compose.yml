@@ -1,0 +1,29 @@
+services:
+  gaokao-major-advisor:
+    build:
+      context: ../../..
+      dockerfile: examples/v1/gaokao-major-advisor/Dockerfile
+    image: gaokao-major-advisor:latest
+    container_name: gaokao-major-advisor
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: 3020
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      MCP_GAOKAO_RANK_ENDPOINT: ${MCP_GAOKAO_RANK_ENDPOINT:-}
+      MCP_GAOKAO_UVX_COMMAND: ${MCP_GAOKAO_UVX_COMMAND:-}
+      UVX_COMMAND: ${UVX_COMMAND:-}
+      GAOKAO_VAULT_DATABASE_URL: ${GAOKAO_VAULT_DATABASE_URL:-}
+      GAOKAO_DB__DSN: ${GAOKAO_DB__DSN:-}
+      GAOKAO_VAULT_DATABASE_SSL: ${GAOKAO_VAULT_DATABASE_SSL:-false}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-3020}:3020"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3020/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

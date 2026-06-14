@@ -1,0 +1,2508 @@
+"use client";
+
+import {
+  CopilotChat,
+  CopilotKitProvider,
+  defineToolCallRenderer,
+  useAgentContext,
+  useComponent,
+} from "@copilotkit/react-core/v2";
+import type { ToolsMenuItem } from "@copilotkit/react-core/v2";
+import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import { z } from "zod";
+
+export const dynamic = "force-dynamic";
+
+const SESSION_STORAGE_KEY = "gaokao-advisor.sessions";
+const ACTIVE_SESSION_STORAGE_KEY = "gaokao-advisor.activeSessionId";
+const PROFILE_STORAGE_KEY = "gaokao-advisor.profileBySession";
+const SUMMARY_STORAGE_KEY = "gaokao-advisor.summaryBySession";
+const TURN_CONTEXT_STORAGE_KEY = "gaokao-advisor.turnContextBySession";
+const SUGGESTIONS_STORAGE_KEY = "gaokao-advisor.suggestionsBySession";
+
+const CURRENT_AGENT_DATE = "2026-06-13";
+const GAOKAO_STAGE_CONTEXT =
+  "当前日期是 2026-06-13，时区 Asia/Shanghai。2026 年全国统考已于 2026-06-07 至 2026-06-08 举行；新高考地区可能延续到 2026-06-09 或 2026-06-10。现在应按高考后查分/志愿准备阶段处理，具体省份安排以省考试院为准。";
+
+const installBoundFetchShim = () => {
+  if (typeof window === "undefined") return;
+  const currentFetch = window.fetch;
+  if (!currentFetch || Reflect.get(currentFetch, "__gaokaoBoundFetch")) return;
+
+  const boundFetch = currentFetch.bind(window);
+  Reflect.set(boundFetch, "__gaokaoBoundFetch", true);
+  window.fetch = boundFetch;
+};
+
+installBoundFetchShim();
+
+const scoreLinePointSchema = z.object({
+  year: z.number().int().describe("录取年份"),
+  score: z.number().describe("最低投档分或录取最低分"),
+  rank: z.number().describe("最低位次；未知时传 -1"),
+  groupName: z.string().describe("专业组或趋势标签，例如 23专业组(物理+化学)、最低门槛"),
+  majorName: z.string().describe("触发该最低分的专业或代表专业；未知时传空字符串"),
+  sourceId: z.string().describe("来源 id，对应 sources[].id"),
+});
+
+const scoreLineTrendChartSchema = z.object({
+  schoolName: z.string().describe("院校名称，例如 苏州大学"),
+  province: z.string().describe("招生省份，例如 江苏"),
+  subjectTrack: z.string().describe("科类或选科，例如 物理类"),
+  dataScope: z
+    .enum(["examAuthorityGroupLine", "schoolMajorScore", "thirdPartyAggregate", "mixed"])
+    .optional()
+    .describe("数据口径：考试院专业组投档线、学校专业录取分、第三方聚合或混合口径"),
+  mode: z
+    .enum(["overallTrend", "groupComparison"])
+    .describe("overallTrend 展示多年最低门槛趋势；groupComparison 展示单年专业组对比"),
+  points: z.array(scoreLinePointSchema).min(1).describe("图表数据点"),
+  sources: z
+    .array(
+      z.object({
+        id: z.string().describe("来源 id"),
+        title: z.string(),
+        url: z.string().describe("来源链接；没有链接时传空字符串"),
+        publisher: z.string().optional(),
+        kind: z.string().optional(),
+      }),
+    )
+    .min(1)
+    .describe("图表数据来源"),
+  analysisSummary: z.string().describe("用一两句话总结趋势和报考含义"),
+  warnings: z.array(z.string()).optional().describe("数据限制，例如位次缺失、来源解析不足"),
+});
+
+type ScoreLineTrendChartArgs = Partial<z.infer<typeof scoreLineTrendChartSchema>> & {
+  years?: number[];
+  scores?: number[];
+  ranks?: number[];
+};
+
+const studentProfileSchema = z.object({
+  province: z.string().optional().describe("高考省份"),
+  subjectTrack: z.string().optional().describe("科类或选科"),
+  score: z.number().optional().describe("高考分数"),
+  rank: z.number().optional().describe("位次"),
+  budget: z.string().optional().describe("家庭预算或学费承受能力"),
+  cityPreference: z.string().optional().describe("城市偏好"),
+  canLeaveProvince: z.boolean().optional().describe("是否接受出省"),
+  graduatePlan: z.string().optional().describe("读研/保研/就业倾向"),
+  majorPreference: z.array(z.string()).optional().describe("偏好的专业方向"),
+  avoidMajors: z.array(z.string()).optional().describe("明确避开的专业方向"),
+  familyType: z.string().optional().describe("家庭约束，例如普通家庭"),
+  updatedAt: z.string().optional(),
+});
+
+const studentProfileSummarySchema = z.object({
+  profile: studentProfileSchema.optional(),
+  missingFields: z.array(z.string()).optional(),
+  nextQuestions: z.array(z.string()).optional(),
+});
+
+const cardSourceSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  url: z.string().optional(),
+  publisher: z.string().optional(),
+  kind: z.string().optional(),
+});
+
+const volunteerPlanCardsSchema = z.object({
+  profile: studentProfileSchema.optional(),
+  tiers: z.array(
+    z.object({
+      tier: z.enum(["冲", "稳", "保"]),
+      items: z.array(
+        z.object({
+          schoolName: z.string(),
+          groupName: z.string().optional(),
+          majorDirection: z.string(),
+          evidence: z.string(),
+          riskLevel: z.string(),
+          reason: z.string(),
+          sourceIds: z.array(z.string()).optional(),
+        }),
+      ),
+    }),
+  ).optional().default([]),
+  warnings: z.array(z.string()).optional(),
+  sources: z.array(cardSourceSchema).optional(),
+});
+
+const admissionRiskCardsSchema = z.object({
+  targetUserType: z.string().optional(),
+  avoid: z.array(z.object({ title: z.string(), reason: z.string() })).optional(),
+  cautious: z.array(z.object({ title: z.string(), reason: z.string() })).optional(),
+  suitable: z.array(z.object({ title: z.string(), reason: z.string() })).optional(),
+  summary: z.string().optional(),
+});
+
+const schoolComparisonCardSchema = z.object({
+  profile: studentProfileSchema.optional(),
+  schools: z.array(
+    z.object({
+      schoolName: z.string(),
+      scoreRisk: z.string(),
+      cityValue: z.string(),
+      majorFit: z.string(),
+      employmentView: z.string(),
+      familyFit: z.string(),
+      verdict: z.string(),
+    }),
+  ).optional().default([]),
+  sources: z.array(cardSourceSchema).optional(),
+  warnings: z.array(z.string()).optional(),
+});
+
+type StudentProfile = z.infer<typeof studentProfileSchema>;
+type StudentProfileSummaryArgs = z.infer<typeof studentProfileSummarySchema>;
+type VolunteerPlanCardsArgs = z.infer<typeof volunteerPlanCardsSchema>;
+type AdmissionRiskCardsArgs = z.infer<typeof admissionRiskCardsSchema>;
+type SchoolComparisonCardArgs = z.infer<typeof schoolComparisonCardSchema>;
+
+type TurnContext = {
+  rawPrompt: string;
+  keyFacts: string[];
+  profilePatch: Partial<StudentProfile>;
+  profileAfterTurn: StudentProfile;
+  missingPriority: Array<keyof StudentProfile>;
+  sessionSummary: string;
+  suggestions: string[];
+  ambiguityWarnings: string[];
+  updatedAt: string;
+};
+
+type PreprocessResponse = {
+  keyFacts?: string[];
+  profilePatch?: Partial<StudentProfile>;
+  missingPriority?: string[];
+  sessionSummary?: string;
+  suggestions?: string[];
+  ambiguityWarnings?: string[];
+};
+
+type RankHydrationResponse =
+  | {
+      status: "ok";
+      rank: number;
+      matchedScore: number;
+      province: string;
+      subjectTrack: string;
+    }
+  | {
+      status: "not_found" | "error";
+      message?: string;
+    };
+
+type LocalSession = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  titleSource?: "default" | "auto" | "manual";
+};
+
+const DEFAULT_SESSION: LocalSession = {
+  id: "gaokao-thread-default",
+  title: "志愿填报",
+  createdAt: "2026-06-13T00:00:00.000+08:00",
+  updatedAt: "2026-06-13T00:00:00.000+08:00",
+  titleSource: "default",
+};
+
+function Icon({
+  name,
+  className = "h-4 w-4",
+}: {
+  name: "plus" | "trash" | "edit" | "search" | "chart" | "message" | "clock" | "send";
+  className?: string;
+}) {
+  const common = {
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+  };
+
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={className} {...common}>
+      {name === "plus" ? (
+        <>
+          <path d="M12 5v14" />
+          <path d="M5 12h14" />
+        </>
+      ) : name === "trash" ? (
+        <>
+          <path d="M3 6h18" />
+          <path d="M8 6V4h8v2" />
+          <path d="M19 6l-1 14H6L5 6" />
+        </>
+      ) : name === "edit" ? (
+        <>
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+        </>
+      ) : name === "search" ? (
+        <>
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
+        </>
+      ) : name === "chart" ? (
+        <>
+          <path d="M4 19V5" />
+          <path d="M4 19h16" />
+          <path d="m7 15 4-5 3 3 5-7" />
+        </>
+      ) : name === "clock" ? (
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
+        </>
+      ) : name === "send" ? (
+        <>
+          <path d="M12 19V5" />
+          <path d="m5 12 7-7 7 7" />
+        </>
+      ) : (
+        <>
+          <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+        </>
+      )}
+    </svg>
+  );
+}
+
+function formatRank(rank: number | null | undefined) {
+  if (typeof rank !== "number" || Number.isNaN(rank) || rank < 0) return "未披露";
+  return rank.toLocaleString("zh-CN");
+}
+
+function compactProfileValue(value: unknown) {
+  if (Array.isArray(value)) return value.filter(Boolean).join("、");
+  if (typeof value === "boolean") return value ? "可出省" : "不出省";
+  if (typeof value === "number") return value.toLocaleString("zh-CN");
+  if (typeof value === "string") return value.trim();
+  return "";
+}
+
+function asArray<T>(value: T[] | undefined | null): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function profileLabelValue(profile: StudentProfile | undefined, key: keyof StudentProfile) {
+  const labels: Record<keyof StudentProfile, string> = {
+    province: "高考省份",
+    subjectTrack: "科类",
+    score: "分数",
+    rank: "位次",
+    budget: "预算",
+    cityPreference: "城市",
+    canLeaveProvince: "出省",
+    graduatePlan: "读研",
+    majorPreference: "偏好",
+    avoidMajors: "避雷",
+    familyType: "家庭",
+    updatedAt: "更新",
+  };
+  const value = compactProfileValue(profile?.[key]);
+  return value ? `${labels[key]}：${value}${key === "score" ? "分" : ""}` : "";
+}
+
+const PROFILE_FIELDS: Array<{
+  key: keyof StudentProfile;
+  label: string;
+  question: string;
+}> = [
+  { key: "province", label: "高考省份", question: "我的高考省份是：" },
+  { key: "subjectTrack", label: "科类", question: "我的科类/选科是：" },
+  { key: "score", label: "分数", question: "我的高考分数是：" },
+  { key: "rank", label: "位次", question: "我的全省位次是：" },
+  { key: "budget", label: "预算", question: "我家里每年学费和生活费大概能接受：" },
+  { key: "cityPreference", label: "城市", question: "我更想去的城市或区域是：" },
+  { key: "canLeaveProvince", label: "出省", question: "我能否接受出省读大学：" },
+  { key: "graduatePlan", label: "读研", question: "我本科后更倾向就业、考研还是保研：" },
+  { key: "majorPreference", label: "专业偏好", question: "我感兴趣的专业方向是：" },
+  { key: "avoidMajors", label: "避雷", question: "我明确不想碰的专业方向是：" },
+];
+
+function getMissingProfileFields(profile: StudentProfile | undefined) {
+  return PROFILE_FIELDS.filter(({ key }) => {
+    const value = profile?.[key];
+    return value === undefined || value === "" || (Array.isArray(value) && value.length === 0);
+  });
+}
+
+const FIELD_BY_LABEL = new Map<string, keyof StudentProfile>(
+  PROFILE_FIELDS.flatMap((field) => [
+    [field.label, field.key],
+    [`${field.label}待补`, field.key],
+  ]),
+);
+
+const SUGGESTION_TEMPLATE_BY_FIELD: Partial<Record<keyof StudentProfile, string[]>> = {
+  province: ["我的高考省份是："],
+  subjectTrack: ["我的科类/选科是："],
+  score: ["我的高考分数是："],
+  rank: ["我的位次是："],
+  budget: ["家里每年预算大概是："],
+  cityPreference: ["我想去的城市/地区是："],
+  canLeaveProvince: ["可以接受出省", "不想出省"],
+  graduatePlan: ["本科后倾向读研", "本科就业优先"],
+  majorPreference: ["我偏好的专业方向是："],
+  avoidMajors: ["我想避开的专业是："],
+};
+
+const DEFAULT_COMPREHENSIVE_PROVINCES = new Set(["北京", "天津", "上海", "浙江", "山东", "海南"]);
+
+function normalizeProvinceForProfile(province: string | undefined) {
+  return province?.trim().replace(/(省|市)$/, "") ?? "";
+}
+
+function isDefaultComprehensiveProvince(province: string | undefined) {
+  return DEFAULT_COMPREHENSIVE_PROVINCES.has(normalizeProvinceForProfile(province));
+}
+
+function withDerivedProfile(profile: StudentProfile | undefined): StudentProfile {
+  const next = { ...(profile ?? {}) };
+  if (!next.subjectTrack && isDefaultComprehensiveProvince(next.province)) {
+    next.subjectTrack = "综合改革";
+  }
+  return next;
+}
+
+function mergeProfile(base: StudentProfile | undefined, patch: Partial<StudentProfile> | undefined) {
+  return {
+    ...(base ?? {}),
+    ...(patch ?? {}),
+    majorPreference: patch?.majorPreference ?? base?.majorPreference,
+    avoidMajors: patch?.avoidMajors ?? base?.avoidMajors,
+  };
+}
+
+function normalizePriorityKeys(items: Array<string | keyof StudentProfile> | undefined) {
+  return uniqueTextItems(
+    (items ?? [])
+      .map((item) => String(item).trim())
+      .map((item) => String(FIELD_BY_LABEL.get(item) ?? item)),
+  ).filter((item): item is keyof StudentProfile =>
+    PROFILE_FIELDS.some((field) => field.key === item),
+  );
+}
+
+function prioritizeMissingFields(
+  profile: StudentProfile | undefined,
+  prompt = "",
+  preferred: Array<string | keyof StudentProfile> = [],
+) {
+  const text = prompt.replace(/\s+/g, "");
+  const missingKeys = getMissingProfileFields(profile).map((field) => field.key);
+  const priority: Array<keyof StudentProfile> = [];
+  const push = (key: keyof StudentProfile) => {
+    if (missingKeys.includes(key) && !priority.includes(key)) priority.push(key);
+  };
+
+  normalizePriorityKeys(preferred).forEach(push);
+
+  if (/能去|能上|报什么|怎么选|学校|大学|专业|志愿|冲稳保|方案|够不够/.test(text)) {
+    push("rank");
+    push("province");
+    push("subjectTrack");
+    push("score");
+  }
+  if (/普通家庭|家里普通|预算|中外|学费|生活费|钱/.test(text)) push("budget");
+  if (/城市|地区|想去|留在|出省|新疆|南京|苏州|上海|北京|广州|深圳|杭州|成都|武汉|西安/.test(text)) {
+    push("cityPreference");
+    push("canLeaveProvince");
+  }
+  if (/读研|保研|就业|本科毕业|考研/.test(text)) push("graduatePlan");
+  if (/专业|方向|计算机|电子|电气|医学|师范|法学|金融/.test(text)) push("majorPreference");
+
+  missingKeys.forEach(push);
+  return priority;
+}
+
+function buildKeyFacts(patch: Partial<StudentProfile>, prompt: string) {
+  const facts = PROFILE_FIELDS.map(({ key }) => profileLabelValue(patch as StudentProfile, key)).filter(Boolean);
+  if (/今年|高考|2026/.test(prompt)) facts.unshift("时间阶段：2026 高考后志愿准备期");
+  return uniqueTextItems(facts);
+}
+
+function compactSessionSummary(previousSummary: string, prompt: string, facts: string[]) {
+  const updatingLabels = facts
+    .map((fact) => fact.split("：")[0]?.trim())
+    .filter(Boolean);
+  const cleanedSummary = previousSummary
+    .split("；")
+    .map((item) => item.trim())
+    .filter(
+      (item) =>
+        item &&
+        !updatingLabels.some((label) => item.startsWith(`${label}：`)),
+    )
+    .join("；");
+  const addition = facts.length ? facts.join("，") : prompt.replace(/\s+/g, " ").trim();
+  const next = [cleanedSummary, addition].filter(Boolean).join("；");
+  return next.length > 220 ? next.slice(next.length - 220) : next;
+}
+
+function buildSuggestions(
+  profile: StudentProfile | undefined,
+  missingPriority: Array<keyof StudentProfile>,
+  lastAssistantText = "",
+) {
+  const suggestions: string[] = [];
+  const pushMany = (items: string[] | undefined) => {
+    items?.forEach((item) => {
+      if (item && !suggestions.includes(item)) suggestions.push(item);
+    });
+  };
+
+  missingPriority.forEach((key) => pushMany(SUGGESTION_TEMPLATE_BY_FIELD[key]));
+
+  if (/位次|排名|排位/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.rank);
+  if (/预算|学费|生活费|中外合作|费用/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.budget);
+  if (/城市|地区|想去|哪里读|省份/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.cityPreference);
+  if (/出省|外省|省内/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.canLeaveProvince);
+  if (/读研|保研|就业/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.graduatePlan);
+
+  if (!profile?.rank && profile?.score) suggestions.unshift("我的位次是：");
+  return uniqueTextItems(suggestions).slice(0, 8);
+}
+
+function buildLocalTurnContext({
+  prompt,
+  profile,
+  previousSummary,
+  lastAssistantText,
+}: {
+  prompt: string;
+  profile: StudentProfile;
+  previousSummary: string;
+  lastAssistantText: string;
+}): TurnContext {
+  const profilePatch = extractProfileFromPrompt(prompt);
+  const rawMergedProfile = mergeProfile(profile, profilePatch);
+  const mergedProfile = withDerivedProfile(rawMergedProfile);
+  const derivedSubjectTrack =
+    !rawMergedProfile.subjectTrack && mergedProfile.subjectTrack ? mergedProfile.subjectTrack : undefined;
+  const enrichedProfilePatch = derivedSubjectTrack
+    ? mergeProfile(profilePatch as StudentProfile, { subjectTrack: derivedSubjectTrack })
+    : profilePatch;
+  const missingPriority = prioritizeMissingFields(mergedProfile, prompt);
+  const keyFacts = buildKeyFacts(enrichedProfilePatch, prompt);
+  const sessionSummary = compactSessionSummary(previousSummary, prompt, keyFacts);
+  const suggestions = buildSuggestions(mergedProfile, missingPriority, lastAssistantText);
+
+  return {
+    rawPrompt: prompt,
+    keyFacts,
+    profilePatch: enrichedProfilePatch,
+    profileAfterTurn: mergedProfile,
+    missingPriority,
+    sessionSummary,
+    suggestions,
+    ambiguityWarnings: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function shouldUseRemotePreprocess(prompt: string) {
+  const compact = prompt.replace(/\s+/g, "");
+  const provinceHits = PROVINCE_CANDIDATES.filter((item) => compact.includes(item)).length;
+  return (
+    compact.length > 42 ||
+    provinceHits > 1 ||
+    /对比|比较|纠结|同时|但是|如果|普通家庭|城市|地区|预算|读研|就业|能去什么学校/.test(compact)
+  );
+}
+
+function readLastAssistantText() {
+  if (typeof document === "undefined") return "";
+  const messages = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"]'));
+  return messages.at(-1)?.innerText.trim() ?? "";
+}
+
+async function requestRemotePreprocess({
+  threadId,
+  rawPrompt,
+  profile,
+  previousSummary,
+  lastAssistantText,
+}: {
+  threadId: string;
+  rawPrompt: string;
+  profile: StudentProfile;
+  previousSummary: string;
+  lastAssistantText: string;
+}) {
+  const response = await fetch("/api/gaokao/preprocess", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      threadId,
+      rawPrompt,
+      profile,
+      previousSummary,
+      lastAssistantText,
+    }),
+  });
+
+  if (!response.ok) throw new Error(`preprocess failed: ${response.status}`);
+  return (await response.json()) as PreprocessResponse;
+}
+
+function normalizeRankHydrationSubject(profile: StudentProfile) {
+  const subjectTrack = profile.subjectTrack?.trim();
+  if (subjectTrack) return subjectTrack;
+  return isDefaultComprehensiveProvince(profile.province) ? "综合改革" : "";
+}
+
+function canAutoHydrateRank(profile: StudentProfile) {
+  const hasRank = typeof profile.rank === "number" && Number.isFinite(profile.rank) && profile.rank > 0;
+  const hasScore = typeof profile.score === "number" && Number.isFinite(profile.score);
+  return Boolean(!hasRank && hasScore && profile.province && normalizeRankHydrationSubject(profile));
+}
+
+async function requestRankHydration(profile: StudentProfile) {
+  if (!canAutoHydrateRank(profile)) return null;
+  const response = await fetch("/api/gaokao/rank", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      province: profile.province,
+      year: 2025,
+      subjectTrack: normalizeRankHydrationSubject(profile),
+      score: profile.score,
+    }),
+  });
+  if (!response.ok) return null;
+  const result = (await response.json()) as RankHydrationResponse;
+  return result.status === "ok" ? result : null;
+}
+
+function mergeRankHydrationIntoTurnContext(
+  turnContext: TurnContext,
+  rankResult: Extract<RankHydrationResponse, { status: "ok" }>,
+  lastAssistantText: string,
+) {
+  const rankPatch: Partial<StudentProfile> = {
+    rank: rankResult.rank,
+    subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
+    updatedAt: new Date().toISOString(),
+  };
+  const profilePatch = mergeProfile(turnContext.profilePatch as StudentProfile, rankPatch);
+  const profileAfterTurn = mergeProfile(turnContext.profileAfterTurn, rankPatch);
+  const rankFacts = buildKeyFacts(rankPatch, turnContext.rawPrompt);
+  const missingPriority = prioritizeMissingFields(
+    profileAfterTurn,
+    turnContext.rawPrompt,
+    turnContext.missingPriority.filter((key) => key !== "rank"),
+  );
+  const suggestions = buildSuggestions(profileAfterTurn, missingPriority, lastAssistantText);
+  const warnings =
+    rankResult.matchedScore !== profileAfterTurn.score
+      ? [`一分一段未精确命中 ${profileAfterTurn.score} 分，已按不高于该分数的 ${rankResult.matchedScore} 分匹配。`]
+      : [];
+
+  return {
+    ...turnContext,
+    keyFacts: uniqueTextItems([...turnContext.keyFacts, ...rankFacts]),
+    profilePatch,
+    profileAfterTurn,
+    missingPriority,
+    sessionSummary: compactSessionSummary(turnContext.sessionSummary, "", rankFacts),
+    suggestions,
+    ambiguityWarnings: uniqueTextItems([...turnContext.ambiguityWarnings, ...warnings]),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function mergeRemoteTurnContext(
+  localTurn: TurnContext,
+  remote: PreprocessResponse,
+  baseProfile: StudentProfile,
+): TurnContext {
+  const remotePatch = remote.profilePatch && typeof remote.profilePatch === "object" ? remote.profilePatch : {};
+  const profilePatch = mergeProfile(localTurn.profilePatch as StudentProfile, remotePatch);
+  const rawMergedProfile = mergeProfile(baseProfile, profilePatch);
+  const mergedProfile = withDerivedProfile(rawMergedProfile);
+  const derivedSubjectTrack =
+    !rawMergedProfile.subjectTrack && mergedProfile.subjectTrack ? mergedProfile.subjectTrack : undefined;
+  const enrichedProfilePatch = derivedSubjectTrack
+    ? mergeProfile(profilePatch as StudentProfile, { subjectTrack: derivedSubjectTrack })
+    : profilePatch;
+  const missingPriority = prioritizeMissingFields(
+    mergedProfile,
+    localTurn.rawPrompt,
+    remote.missingPriority,
+  );
+  const suggestions = uniqueTextItems([...(remote.suggestions ?? []), ...localTurn.suggestions]).slice(0, 8);
+
+  return {
+    ...localTurn,
+    keyFacts: uniqueTextItems([...(remote.keyFacts ?? []), ...localTurn.keyFacts]),
+    profilePatch: enrichedProfilePatch,
+    profileAfterTurn: mergedProfile,
+    missingPriority,
+    sessionSummary: remote.sessionSummary?.trim() || localTurn.sessionSummary,
+    suggestions: suggestions.length ? suggestions : localTurn.suggestions,
+    ambiguityWarnings: uniqueTextItems([
+      ...(remote.ambiguityWarnings ?? []),
+      ...localTurn.ambiguityWarnings,
+    ]),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+const PROVINCE_CANDIDATES = [
+  "北京",
+  "天津",
+  "上海",
+  "重庆",
+  "河北",
+  "山西",
+  "辽宁",
+  "吉林",
+  "黑龙江",
+  "江苏",
+  "浙江",
+  "安徽",
+  "福建",
+  "江西",
+  "山东",
+  "河南",
+  "湖北",
+  "湖南",
+  "广东",
+  "海南",
+  "四川",
+  "贵州",
+  "云南",
+  "陕西",
+  "甘肃",
+  "青海",
+  "内蒙古",
+  "广西",
+  "西藏",
+  "宁夏",
+  "新疆",
+];
+
+function uniqueTextItems(items: string[]) {
+  return Array.from(new Set(items.map((item) => item.trim()).filter(Boolean))).slice(0, 6);
+}
+
+function hasDestinationContext(text: string, candidate: string) {
+  const index = text.indexOf(candidate);
+  if (index < 0) return false;
+  const before = text.slice(Math.max(0, index - 8), index);
+  const after = text.slice(index + candidate.length, index + candidate.length + 10);
+  return (
+    /(想去|要去|想在|希望去|希望在|考虑去|接受去|能去|去|留在|目标|偏好|想去的城市(?:是|为)?|目标城市(?:是|为)?|目标地区(?:是|为)?|城市偏好(?:是|为)?|地区偏好(?:是|为)?|城市(?:是|为)?|地区(?:是|为)?)$/.test(before) ||
+    /^(读|读书|上大学|大学|发展|就业|读研|生活)/.test(after)
+  );
+}
+
+function hasExamProvinceContext(text: string, candidate: string) {
+  const index = text.indexOf(candidate);
+  if (index < 0 || hasDestinationContext(text, candidate)) return false;
+  const before = text.slice(Math.max(0, index - 10), index);
+  const after = text.slice(index + candidate.length, index + candidate.length + 12);
+  return (
+    /(高考省份(?:是|为)?|考试省份(?:是|为)?|生源地(?:是|为)?|考籍(?:是|为)?|学籍(?:是|为)?|户籍(?:是|为)?|我在|我是|来自|本省|省份(?:是|为)?|高考在|在)$/.test(before) ||
+    /^(考生|高考|物理|历史|理科|文科|选科|综合|位次|排名|分|全省)/.test(after)
+  );
+}
+
+function extractProfileFromPrompt(prompt: string): Partial<StudentProfile> {
+  const text = prompt.replace(/\s+/g, "");
+  const lower = prompt.toLowerCase();
+  const patch: Partial<StudentProfile> = {};
+  const mentionedProvinces = PROVINCE_CANDIDATES.filter((item) => text.includes(item));
+  const destinationProvinces = mentionedProvinces.filter((item) => hasDestinationContext(text, item));
+  const examProvince = mentionedProvinces.find((item) => hasExamProvinceContext(text, item));
+  if (examProvince) patch.province = examProvince;
+
+  if (/物理|理科|physics/.test(lower)) patch.subjectTrack = /理科/.test(text) ? "理科" : "物理类";
+  if (/历史|文科|history/.test(lower)) patch.subjectTrack = /文科/.test(text) ? "文科" : "历史类";
+
+  const scoreMatch = text.match(/(?:^|[^\d])(\d{3})(?:分|$|[^\d])/);
+  if (scoreMatch) patch.score = Number(scoreMatch[1]);
+
+  const rankMatch = text.match(/(?:位次|排名|排位|名次)[约大概]?(\d{3,7})|(\d{3,7})(?:名|位)/);
+  const rankValue = rankMatch?.[1] ?? rankMatch?.[2];
+  if (rankValue) patch.rank = Number(rankValue);
+
+  if (/普通家庭|家里普通|工薪|预算有限|农村|县城/.test(text)) patch.familyType = "普通家庭";
+  if (/预算|学费|生活费|中外|合作|钱/.test(text)) {
+    const budgetMatch = prompt.match(/(?:预算|学费|生活费|一年|每年)[^，。,.!?？]{0,16}/);
+    patch.budget = budgetMatch?.[0]?.trim() || "需控制成本";
+  }
+  if (/不出省|不想出省|留本省|留省内/.test(text)) patch.canLeaveProvince = false;
+  if (/可出省|能出省|接受出省|外省/.test(text)) patch.canLeaveProvince = true;
+
+  const citySignals = uniqueTextItems(
+    [
+      ...destinationProvinces,
+      ...["南京", "苏州", "无锡", "上海", "杭州", "北京", "天津", "广州", "深圳", "武汉", "成都", "西安", "省会", "长三角", "珠三角", "北上广深"].filter(
+        (item) => text.includes(item) && (hasDestinationContext(text, item) || /城市|地区|想去|留在|目标|偏好/.test(text)),
+      ),
+    ],
+  );
+  if (citySignals.length) patch.cityPreference = citySignals.join("、");
+
+  if (/考研|读研|保研|研究生/.test(text)) patch.graduatePlan = "倾向读研/保研";
+  if (/就业|本科毕业工作|直接工作/.test(text)) patch.graduatePlan = "本科就业优先";
+
+  const majorPreference = uniqueTextItems(
+    ["计算机", "软件", "电子", "电气", "自动化", "通信", "机械", "医学", "师范", "法学", "会计", "金融", "数学", "统计", "人工智能"].filter(
+      (item) => text.includes(item) && !new RegExp(`不想|别碰|避开|不喜欢`).test(text),
+    ),
+  );
+  if (majorPreference.length) patch.majorPreference = majorPreference;
+
+  const avoidMatches = prompt.match(/(?:避开|别碰|不想学|不喜欢|不报)([^。！？!?，,]{2,30})/g);
+  if (avoidMatches?.length) patch.avoidMajors = uniqueTextItems(avoidMatches.map((item) => item.replace(/^(避开|别碰|不想学|不喜欢|不报)/, "")));
+
+  if (Object.keys(patch).length > 0) patch.updatedAt = new Date().toISOString();
+  return patch;
+}
+
+function isOfficialAdmissionSource(source: {
+  url?: string;
+  kind?: string;
+  publisher?: string;
+  title?: string;
+}) {
+  const sourceText = `${source.kind ?? ""} ${source.publisher ?? ""} ${source.title ?? ""}`;
+  if (/official|考试院|招生办公室|招生网|教育考试院/.test(sourceText)) return true;
+
+  try {
+    const hostname = new URL(source.url ?? "").hostname.toLowerCase();
+    return (
+      hostname.endsWith(".edu.cn") ||
+      hostname.endsWith(".gov.cn") ||
+      hostname === "jseea.cn" ||
+      hostname.endsWith(".jseea.cn") ||
+      hostname === "chsi.com.cn" ||
+      hostname.endsWith(".chsi.com.cn")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeChartPoints(args: ScoreLineTrendChartArgs) {
+  if (Array.isArray(args.points) && args.points.length > 0) {
+    return args.points
+      .filter((point) => typeof point.year === "number" && typeof point.score === "number")
+      .map((point) => ({
+        year: point.year,
+        score: point.score,
+        rank: point.rank ?? -1,
+        groupName: point.groupName || "最低门槛",
+        majorName: point.majorName || "",
+        sourceId: point.sourceId || "",
+      }));
+  }
+
+  if (Array.isArray(args.years) && Array.isArray(args.scores)) {
+    return args.years
+      .map((year, index) => ({
+        year,
+        score: args.scores?.[index],
+        rank: args.ranks?.[index] ?? -1,
+        groupName: "最低门槛",
+        majorName: "",
+        sourceId: "",
+      }))
+      .filter((point): point is z.infer<typeof scoreLinePointSchema> => {
+        return typeof point.year === "number" && typeof point.score === "number";
+      });
+  }
+
+  return [];
+}
+
+function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
+  const points = normalizeChartPoints(args);
+  const mode = args.mode ?? (points.length > 1 ? "overallTrend" : "groupComparison");
+  const schoolName = args.schoolName || "院校";
+  const province = args.province || "省份";
+  const subjectTrack = args.subjectTrack || "科类";
+  const sources = Array.isArray(args.sources) ? args.sources : [];
+  const warnings = Array.isArray(args.warnings) ? args.warnings : [];
+  const hasOfficialSource = sources.some(isOfficialAdmissionSource);
+  const inferredScope = args.dataScope ?? (hasOfficialSource ? "mixed" : "thirdPartyAggregate");
+  const scopeLabel =
+    inferredScope === "examAuthorityGroupLine"
+      ? "考试院投档线"
+      : inferredScope === "schoolMajorScore"
+        ? "学校专业分"
+        : inferredScope === "thirdPartyAggregate"
+          ? "第三方聚合"
+          : "混合口径";
+  const sourceLabel = hasOfficialSource ? scopeLabel : "第三方聚合";
+
+  const width = 360;
+  const trendHeight = 190;
+  const visibleBars = [...points].sort((a, b) => b.score - a.score).slice(0, 14);
+  const barHeight = Math.max(230, Math.min(470, visibleBars.length * 30 + 76));
+  const height = mode === "groupComparison" ? barHeight : trendHeight;
+  const padding =
+    mode === "groupComparison"
+      ? { top: 24, right: 48, bottom: 42, left: 126 }
+      : { top: 24, right: 18, bottom: 34, left: 42 };
+  const scoreValues = points.map((point) => point.score);
+  const minScore = scoreValues.length ? Math.min(...scoreValues) : 0;
+  const maxScore = scoreValues.length ? Math.max(...scoreValues) : 0;
+  const scoreRange = Math.max(maxScore - minScore, 1);
+
+  const trendPoints = points.map((point, index) => {
+    const plotWidth = width - padding.left - padding.right;
+    const plotHeight = trendHeight - padding.top - padding.bottom;
+    const x =
+      padding.left +
+      (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
+    const y = padding.top + ((maxScore - point.score) / scoreRange) * plotHeight;
+    return { ...point, x, y };
+  });
+
+  const linePath = trendPoints
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
+    .join(" ");
+
+  return (
+    <div className="gaokao-score-chart my-3 w-full max-w-full overflow-hidden rounded-lg border border-zinc-200 bg-white text-zinc-950 shadow-sm">
+      <div className="border-b border-zinc-100 px-3 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-xs font-semibold text-red-700">
+              <Icon name="chart" className="h-3.5 w-3.5" />
+              <span>{mode === "groupComparison" ? "专业组分数对比" : "分数线趋势"}</span>
+            </div>
+            <h3 className="mt-1 break-words text-base font-semibold leading-6">
+              {schoolName} · {province}{subjectTrack}
+            </h3>
+          </div>
+          <span className="shrink-0 rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-600">
+            {sourceLabel}
+          </span>
+        </div>
+      </div>
+
+      <div className="px-3 py-3">
+        {!hasOfficialSource ? (
+          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
+            以下曲线使用第三方聚合/搜索数据生成，可能存在更新滞后、专业组口径不同或页面转述误差。正式填报前请以省考试院和院校招生网核验。
+          </div>
+        ) : null}
+
+        {inferredScope === "mixed" ? (
+          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
+            当前图表为混合口径：可能同时包含考试院专业组投档线、学校专业录取分或第三方聚合数据，不可直接横向硬比。
+          </div>
+        ) : null}
+
+        {points.length > 0 ? (
+          <svg
+            className="block h-auto w-full"
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label={`${schoolName}${province}${subjectTrack}分数线图表`}
+          >
+            {mode === "groupComparison" ? (
+              <>
+                {visibleBars.map((point, index) => {
+                  const barTop = padding.top + index * 30;
+                  const plotWidth = width - padding.left - padding.right;
+                  const scoreRatio =
+                    maxScore === minScore ? 1 : (point.score - minScore) / scoreRange;
+                  const barWidth = Math.max(
+                    22,
+                    18 + scoreRatio * (plotWidth - 18),
+                  );
+                  const label = point.groupName.replace(/\s+/g, "").slice(0, 13);
+                  return (
+                    <g key={`${point.year}-${point.groupName}-${point.score}`}>
+                      <title>{point.groupName}</title>
+                      <text x="4" y={barTop + 14} className="fill-zinc-500 text-[9px]">
+                        {label}
+                      </text>
+                      <rect
+                        x={padding.left}
+                        y={barTop}
+                        width={barWidth}
+                        height="18"
+                        rx="4"
+                        fill={index === 0 ? "#991b1b" : "#dc2626"}
+                        opacity={index === 0 ? 0.95 : 0.75}
+                      />
+                      <text
+                        x={Math.min(width - 30, padding.left + barWidth + 6)}
+                        y={barTop + 13}
+                        className="fill-zinc-900 text-[10px] font-semibold"
+                      >
+                        {point.score}
+                      </text>
+                    </g>
+                  );
+                })}
+                <text x="4" y={height - 12} className="fill-zinc-500 text-[10px]">
+                  按专业组最低分展示，最多显示 14 组
+                </text>
+              </>
+            ) : (
+              <>
+                <line
+                  x1={padding.left}
+                  y1={padding.top}
+                  x2={padding.left}
+                  y2={trendHeight - padding.bottom}
+                  stroke="#e4e4e7"
+                />
+                <line
+                  x1={padding.left}
+                  y1={trendHeight - padding.bottom}
+                  x2={width - padding.right}
+                  y2={trendHeight - padding.bottom}
+                  stroke="#e4e4e7"
+                />
+                <text x="4" y={padding.top + 4} className="fill-zinc-500 text-[10px]">
+                  {maxScore}
+                </text>
+                <text x="4" y={trendHeight - padding.bottom} className="fill-zinc-500 text-[10px]">
+                  {minScore}
+                </text>
+                <path d={linePath} fill="none" stroke="#b91c1c" strokeWidth="3" />
+                {trendPoints.map((point) => (
+                  <g key={`${point.year}-${point.groupName}-${point.score}`}>
+                    <circle cx={point.x} cy={point.y} r="4.5" fill="#b91c1c" />
+                    <text
+                      x={point.x}
+                      y={Math.max(12, point.y - 9)}
+                      textAnchor="middle"
+                      className="fill-zinc-900 text-[10px] font-semibold"
+                    >
+                      {point.score}
+                    </text>
+                    <text
+                      x={point.x}
+                      y={trendHeight - 12}
+                      textAnchor="middle"
+                      className="fill-zinc-500 text-[10px]"
+                    >
+                      {point.year}
+                    </text>
+                  </g>
+                ))}
+              </>
+            )}
+          </svg>
+        ) : (
+          <div className="rounded-md border border-dashed border-zinc-300 bg-zinc-50 p-3 text-sm leading-6 text-zinc-600">
+            暂无可绘制的分数线数据。需要至少查到年份、分数和来源；第三方数据会被明确标注，不能用猜测数据画图。
+          </div>
+        )}
+
+        {points.length > 0 ? (
+          <div className="mt-3 space-y-2 text-xs text-zinc-700" aria-label="录取分数线明细">
+            {points.slice(0, 8).map((point) => (
+              <div
+                key={`score-card-${point.year}-${point.groupName}-${point.score}`}
+                className="rounded-md border border-zinc-100 bg-zinc-50 px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-zinc-950">{point.year}</span>
+                  <span className="rounded border border-red-100 bg-white px-2 py-0.5 font-semibold text-red-700">
+                    {point.score} 分
+                  </span>
+                </div>
+                <p className="mt-1 break-words leading-5 text-zinc-700">{point.groupName}</p>
+                <p className="mt-1 leading-5 text-zinc-500">最低位次：{formatRank(point.rank)}</p>
+                {point.majorName ? (
+                  <p className="mt-1 break-words leading-5 text-zinc-500">
+                    最低专业：{point.majorName}
+                  </p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {args.analysisSummary ? (
+          <p className="mt-3 text-sm leading-6 text-zinc-800">{args.analysisSummary}</p>
+        ) : null}
+
+        {warnings.length > 0 ? (
+          <div className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+            {warnings.slice(0, 2).map((warning) => (
+              <p key={warning}>{warning}</p>
+            ))}
+          </div>
+        ) : null}
+
+        {sources.length > 0 ? (
+          <div className="mt-3 border-t border-zinc-100 pt-2">
+            <p className="text-xs font-semibold text-zinc-500">来源</p>
+            <div className="mt-1 grid gap-1">
+              {sources.slice(0, 4).map((source, index) =>
+                source.url?.trim() ? (
+                  <a
+                    key={`${source.title}-${index}`}
+                    href={source.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="break-words text-xs text-red-700 underline underline-offset-2"
+                  >
+                    {source.title}
+                  </a>
+                ) : (
+                  <span
+                    key={`${source.title}-${index}`}
+                    className="break-words text-xs text-zinc-600"
+                  >
+                    {source.title}
+                  </span>
+                ),
+              )}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ProfilePill({
+  children,
+  muted = false,
+  highlight = false,
+  onClick,
+}: {
+  children: ReactNode;
+  muted?: boolean;
+  highlight?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`shrink-0 rounded-md border px-2 py-1 text-[11px] leading-4 ${
+        highlight
+          ? "border-red-300 bg-red-50 font-semibold text-red-800 shadow-sm"
+          : muted
+          ? "border-dashed border-zinc-300 bg-zinc-50 text-zinc-500"
+          : "border-zinc-200 bg-white text-zinc-800"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function StudentProfileSummary({ profile, missingFields = [], nextQuestions = [] }: StudentProfileSummaryArgs) {
+  const safeProfile = withDerivedProfile(profile);
+  const knownItems = PROFILE_FIELDS.map(({ key }) => profileLabelValue(safeProfile, key)).filter(Boolean);
+  const actualMissingLabels = new Set(getMissingProfileFields(safeProfile).map((field) => field.label));
+  const missing = missingFields.length
+    ? missingFields.filter((field) => actualMissingLabels.has(field))
+    : getMissingProfileFields(safeProfile).slice(0, 4).map((field) => field.label);
+
+  return (
+    <div className="my-3 w-full rounded-lg border border-zinc-200 bg-white p-3 text-zinc-950 shadow-sm">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <p className="text-xs font-semibold text-red-700">当前画像</p>
+          <h3 className="mt-1 text-base font-semibold">填报判断依据</h3>
+        </div>
+        <span className="rounded border border-zinc-200 px-2 py-1 text-xs text-zinc-500">
+          本地会话
+        </span>
+      </div>
+      <div className="mt-3 grid gap-2">
+        <div className="min-w-0 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-2">
+          <p className="mb-2 text-[11px] font-semibold text-zinc-500">当前画像</p>
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
+            {knownItems.length ? (
+              knownItems.map((item) => <ProfilePill key={item}>{item}</ProfilePill>)
+            ) : (
+              <span className="text-xs leading-5 text-zinc-500">还没收集到足够画像。</span>
+            )}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md border border-dashed border-zinc-300 bg-white px-2 py-2">
+          <p className="mb-2 text-[11px] font-semibold text-zinc-500">待补画像</p>
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
+            {missing.length ? (
+              missing.map((item, index) => (
+                <ProfilePill key={`missing-${item}`} muted highlight={index === 0}>
+                  {item}待补
+                </ProfilePill>
+              ))
+            ) : (
+              <span className="text-xs leading-5 text-zinc-500">关键项已补齐</span>
+            )}
+          </div>
+        </div>
+      </div>
+      {nextQuestions.length > 0 ? (
+        <div className="mt-3 rounded-md bg-zinc-50 px-3 py-2 text-xs leading-5 text-zinc-700">
+          {nextQuestions.slice(0, 3).map((question) => (
+            <p key={question}>{question}</p>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function VolunteerPlanCards({ profile, tiers, warnings = [], sources = [] }: VolunteerPlanCardsArgs) {
+  const safeTiers = asArray(tiers).map((tier) => ({
+    ...tier,
+    items: asArray(tier?.items),
+  }));
+  const safeWarnings = asArray(warnings);
+  const safeSources = asArray(sources);
+  const tierTone: Record<string, string> = {
+    冲: "border-red-200 bg-red-50 text-red-800",
+    稳: "border-zinc-300 bg-white text-zinc-900",
+    保: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  };
+
+  return (
+    <div className="my-3 w-full rounded-lg border border-zinc-200 bg-white p-3 text-zinc-950 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold text-red-700">冲稳保方案</p>
+          <h3 className="mt-1 text-base font-semibold">按风险分层看，不按感觉报</h3>
+        </div>
+        {profile?.score ? (
+          <span className="rounded border border-zinc-200 px-2 py-1 text-xs text-zinc-600">
+            {profile.score}分
+          </span>
+        ) : null}
+      </div>
+
+      <div className="mt-3 grid gap-3">
+        {safeTiers.length ? (
+          safeTiers.map((tier) => (
+          <section key={tier.tier} className="rounded-md border border-zinc-200">
+            <div className={`border-b px-3 py-2 text-sm font-semibold ${tierTone[tier.tier] ?? tierTone["稳"]}`}>
+              {tier.tier} · {tier.items.length} 个方向
+            </div>
+            <div className="grid gap-2 p-2">
+              {tier.items.map((item) => (
+                <article
+                  key={`${tier.tier}-${item.schoolName}-${item.majorDirection}`}
+                  className="rounded-md bg-zinc-50 px-3 py-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <h4 className="break-words text-sm font-semibold">{item.schoolName}</h4>
+                      <p className="mt-1 break-words text-xs leading-5 text-zinc-600">
+                        {item.groupName || "专业组待核验"} · {item.majorDirection}
+                      </p>
+                    </div>
+                    <span className="shrink-0 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs text-zinc-700">
+                      {item.riskLevel}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-zinc-700">{item.reason}</p>
+                  <p className="mt-1 text-xs leading-5 text-zinc-500">{item.evidence}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+          ))
+        ) : (
+          <p className="rounded-md bg-zinc-50 px-3 py-2 text-xs leading-5 text-zinc-600">
+            方案数据不足，请先补充分数、位次、科类和城市/预算偏好。
+          </p>
+        )}
+      </div>
+
+      {safeWarnings.length > 0 ? (
+        <div className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+          {safeWarnings.slice(0, 2).map((warning) => (
+            <p key={warning}>{warning}</p>
+          ))}
+        </div>
+      ) : null}
+
+      {safeSources.length > 0 ? <SourceList sources={safeSources} /> : null}
+    </div>
+  );
+}
+
+function AdmissionRiskCards({
+  targetUserType = "普通家庭考生",
+  avoid = [],
+  cautious = [],
+  suitable = [],
+  summary,
+}: AdmissionRiskCardsArgs) {
+  const groups = [
+    { title: "不建议碰", items: asArray(avoid), tone: "border-red-200 bg-red-50 text-red-800" },
+    { title: "谨慎选择", items: asArray(cautious), tone: "border-amber-200 bg-amber-50 text-amber-900" },
+    { title: "可考虑", items: asArray(suitable), tone: "border-emerald-200 bg-emerald-50 text-emerald-800" },
+  ];
+
+  return (
+    <div className="my-3 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-950 shadow-sm">
+      <p className="text-xs font-semibold text-red-700">专业风险</p>
+      <h3 className="mt-1 text-base font-semibold">{targetUserType}优先看确定性</h3>
+      {summary ? <p className="mt-2 text-sm leading-6 text-zinc-700">{summary}</p> : null}
+      <div className="mt-3 grid gap-2">
+        {groups.map((group) => (
+          <section key={group.title} className="rounded-md border border-zinc-200">
+            <div className={`border-b px-3 py-2 text-sm font-semibold ${group.tone}`}>{group.title}</div>
+            <div className="grid gap-2 p-2">
+              {group.items.length ? (
+                group.items.map((item) => (
+                  <div key={`${group.title}-${item.title}`} className="rounded-md bg-zinc-50 px-3 py-2">
+                    <p className="text-sm font-semibold">{item.title}</p>
+                    <p className="mt-1 text-xs leading-5 text-zinc-600">{item.reason}</p>
+                  </div>
+                ))
+              ) : (
+                <p className="px-1 py-1 text-xs text-zinc-500">暂无明确项。</p>
+              )}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SchoolComparisonCard({ schools, sources = [], warnings = [] }: SchoolComparisonCardArgs) {
+  const safeSchools = asArray(schools);
+  const safeSources = asArray(sources);
+  const safeWarnings = asArray(warnings);
+
+  return (
+    <div className="my-3 rounded-lg border border-zinc-200 bg-white p-3 text-zinc-950 shadow-sm">
+      <p className="text-xs font-semibold text-red-700">院校对比</p>
+      <h3 className="mt-1 text-base font-semibold">按普通学生路径比较</h3>
+      <div className="mt-3 grid gap-3">
+        {safeSchools.length ? (
+          safeSchools.map((school) => (
+          <article key={school.schoolName} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
+            <div className="flex items-start justify-between gap-2">
+              <h4 className="break-words text-sm font-semibold">{school.schoolName}</h4>
+              <span className="shrink-0 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs text-zinc-700">
+                {school.scoreRisk}
+              </span>
+            </div>
+            <div className="mt-2 grid gap-1 text-xs leading-5 text-zinc-700">
+              <p>城市：{school.cityValue}</p>
+              <p>专业：{school.majorFit}</p>
+              <p>就业：{school.employmentView}</p>
+              <p>家庭适配：{school.familyFit}</p>
+            </div>
+            <p className="mt-2 rounded-md bg-white px-2 py-1.5 text-xs font-medium leading-5 text-zinc-900">
+              {school.verdict}
+            </p>
+          </article>
+          ))
+        ) : (
+          <p className="rounded-md bg-zinc-50 px-3 py-2 text-xs leading-5 text-zinc-600">
+            对比数据不足，请至少给出 2 所学校和你的高考省份、科类、位次。
+          </p>
+        )}
+      </div>
+      {safeWarnings.length > 0 ? (
+        <div className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+          {safeWarnings.slice(0, 2).map((warning) => (
+            <p key={warning}>{warning}</p>
+          ))}
+        </div>
+      ) : null}
+      {safeSources.length > 0 ? <SourceList sources={safeSources} /> : null}
+    </div>
+  );
+}
+
+function SourceList({ sources }: { sources: Array<z.infer<typeof cardSourceSchema>> }) {
+  const safeSources = asArray(sources);
+
+  return (
+    <div className="mt-3 border-t border-zinc-100 pt-2">
+      <p className="text-xs font-semibold text-zinc-500">来源</p>
+      <div className="mt-1 grid gap-1">
+        {safeSources.slice(0, 4).map((source, index) =>
+          source.url?.trim() ? (
+            <a
+              key={`${source.title}-${index}`}
+              href={source.url}
+              target="_blank"
+              rel="noreferrer"
+              className="break-words text-xs text-red-700 underline underline-offset-2"
+            >
+              {source.title}
+            </a>
+          ) : (
+            <span key={`${source.title}-${index}`} className="break-words text-xs text-zinc-600">
+              {source.title}
+            </span>
+          ),
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ToolReasoning({
+  name,
+  args,
+  status,
+}: {
+  name: string;
+  args?: unknown;
+  status: string;
+}) {
+  const isInternalGenerativeUiTool =
+    name === "AGUISendStateDelta" ||
+    name.startsWith("AGUI") ||
+    name.startsWith("agui") ||
+    name.includes("AGUI");
+
+  if (
+    isInternalGenerativeUiTool ||
+    name === "scoreLineTrendChart" ||
+    name === "studentProfileSummary" ||
+    name === "volunteerPlanCards" ||
+    name === "admissionRiskCards" ||
+    name === "schoolComparisonCard" ||
+    name === "render_a2ui" ||
+    name === "generate_a2ui"
+  ) {
+    return null;
+  }
+
+  const isRunning = status === "executing" || status === "inProgress";
+  const entries =
+    args && typeof args === "object" && !Array.isArray(args) ? Object.entries(args) : [];
+  const label =
+    name === "lookupAdmissionScores"
+      ? "官方分数线查询"
+      : name === "lookupRankByScore"
+        ? "位次查询"
+        : name === "researchGaokaoData"
+          ? "联网检索"
+          : name === "buildVolunteerPlan"
+            ? "冲稳保方案"
+            : name === "explainAdmissionRisk"
+              ? "风险解释"
+              : name === "compareSchools"
+                ? "院校对比"
+                : name;
+  const processLabel =
+    name === "researchGaokaoData"
+      ? "检索过程"
+      : name === "lookupAdmissionScores" || name === "lookupRankByScore"
+        ? "思考过程"
+        : "工具过程";
+
+  return (
+    <details
+      open={isRunning}
+      className="my-2 px-3 text-xs text-zinc-600"
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2 py-1.5 font-medium text-zinc-600">
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-50 text-zinc-500 ring-1 ring-zinc-200">
+          <Icon
+            name={name === "lookupAdmissionScores" || name === "researchGaokaoData" ? "search" : "clock"}
+            className="h-3 w-3"
+          />
+        </span>
+        <span className="min-w-0 flex-1 truncate">
+          {processLabel} · {label}
+        </span>
+        <span
+          className={`shrink-0 rounded border px-1.5 py-0.5 text-[11px] ${
+            isRunning
+              ? "border-red-100 bg-red-50 text-red-700"
+              : "border-emerald-100 bg-emerald-50 text-emerald-700"
+          }`}
+        >
+          {isRunning ? "进行中" : "已折叠"}
+        </span>
+      </summary>
+      {entries.length > 0 ? (
+        <div className="ml-7 grid gap-1 border-l border-zinc-200 px-3 py-1.5">
+          {entries.slice(0, 5).map(([key, value]) => (
+            <div key={key} className="grid grid-cols-[72px_1fr] gap-2">
+              <span className="text-zinc-500">{key}</span>
+              <span className="truncate text-zinc-700">
+                {typeof value === "string" || typeof value === "number"
+                  ? String(value)
+                  : Array.isArray(value)
+                    ? `[${value.join(", ")}]`
+                    : JSON.stringify(value)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+function createSession(title = "新会话"): LocalSession {
+  const now = new Date().toISOString();
+  const randomId =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return {
+    id: `gaokao-thread-${randomId}`,
+    title,
+    createdAt: now,
+    updatedAt: now,
+    titleSource: "default",
+  };
+}
+
+function findFirstMatch(text: string, candidates: string[]) {
+  return candidates.find((candidate) => text.includes(candidate));
+}
+
+function isGenericSessionTitle(title: string) {
+  return ["新会话", "志愿填报", "高考咨询", "志愿咨询"].includes(title.trim());
+}
+
+function deriveSessionTitleFromPrompt(prompt: string) {
+  const text = prompt.replace(/\s+/g, "");
+  if (!text) return "";
+
+  const schoolMatch = text.match(
+    /([\u4e00-\u9fa5]{2,16}(?:大学|学院|医科大学|师范大学|工业大学|理工大学|交通大学|航空航天大学|农业大学|财经大学|政法大学))/,
+  );
+  const schoolName = schoolMatch?.[1];
+  if (schoolName) {
+    if (/趋势|近三年|三年|历年|走势/.test(text)) return `${schoolName}趋势`.slice(0, 14);
+    if (/分数线|投档线|录取|最低分|专业组/.test(text)) return `${schoolName}分数线`.slice(0, 14);
+    return `${schoolName}咨询`.slice(0, 14);
+  }
+
+  const englishProvinceMap: Record<string, string> = {
+    beijing: "北京",
+    tianjin: "天津",
+    shanghai: "上海",
+    chongqing: "重庆",
+    jiangsu: "江苏",
+    zhejiang: "浙江",
+    guangdong: "广东",
+    shandong: "山东",
+    henan: "河南",
+    hubei: "湖北",
+    hunan: "湖南",
+    sichuan: "四川",
+    shaanxi: "陕西",
+  };
+  const lowerPrompt = prompt.toLowerCase();
+  const englishProvince = Object.entries(englishProvinceMap).find(([key]) =>
+    lowerPrompt.includes(key),
+  )?.[1];
+  const province = englishProvince ?? findFirstMatch(text, [
+    "北京",
+    "天津",
+    "上海",
+    "重庆",
+    "河北",
+    "山西",
+    "辽宁",
+    "吉林",
+    "黑龙江",
+    "江苏",
+    "浙江",
+    "安徽",
+    "福建",
+    "江西",
+    "山东",
+    "河南",
+    "湖北",
+    "湖南",
+    "广东",
+    "海南",
+    "四川",
+    "贵州",
+    "云南",
+    "陕西",
+    "甘肃",
+    "青海",
+    "内蒙古",
+    "广西",
+    "西藏",
+    "宁夏",
+    "新疆",
+  ]);
+
+  if (
+    province &&
+    (/选科|选考|物理|历史|物化|文科|理科|科类|综合|专业|志愿|报考|位次|冲稳保|分/.test(text) ||
+      /physics|history|score|rank|volunteer|advice|major|college|application/.test(lowerPrompt))
+  ) {
+    return `${province}选考意见`;
+  }
+
+  const scoreMatch = text.match(/(\d{3})分?/);
+  if (scoreMatch) return `${scoreMatch[1]}分志愿建议`;
+
+  const compact = prompt.replace(/[|#*_`~>\[\](){}]/g, "").replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.slice(0, 12);
+}
+
+function useLocalSessions() {
+  const [hydrated, setHydrated] = useState(false);
+  const [sessions, setSessions] = useState<LocalSession[]>([DEFAULT_SESSION]);
+  const [activeSessionId, setActiveSessionId] = useState(DEFAULT_SESSION.id);
+
+  useEffect(() => {
+    try {
+      const storedSessions = localStorage.getItem(SESSION_STORAGE_KEY);
+      const parsedSessions = storedSessions ? (JSON.parse(storedSessions) as LocalSession[]) : null;
+      const validSessions =
+        Array.isArray(parsedSessions) && parsedSessions.length > 0
+          ? parsedSessions.filter((session) => session.id && session.title)
+          : [DEFAULT_SESSION];
+      const activeId = localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+      setSessions(validSessions.length ? validSessions : [DEFAULT_SESSION]);
+      setActiveSessionId(
+        activeId && validSessions.some((session) => session.id === activeId)
+          ? activeId
+          : validSessions[0]?.id ?? DEFAULT_SESSION.id,
+      );
+    } catch {
+      setSessions([DEFAULT_SESSION]);
+      setActiveSessionId(DEFAULT_SESSION.id);
+    } finally {
+      setHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessions));
+    localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeSessionId);
+  }, [activeSessionId, hydrated, sessions]);
+
+  const createNewSession = useCallback(() => {
+    const nextSession = createSession("新会话");
+    setSessions((current) => [nextSession, ...current]);
+    setActiveSessionId(nextSession.id);
+  }, []);
+
+  const renameSession = useCallback((sessionId: string, title: string) => {
+    const cleanedTitle = title.trim().slice(0, 24);
+    if (!cleanedTitle) return;
+
+    setSessions((items) =>
+      items.map((session) =>
+        session.id === sessionId
+          ? {
+              ...session,
+              title: cleanedTitle,
+              titleSource: "manual",
+              updatedAt: new Date().toISOString(),
+            }
+          : session,
+      ),
+    );
+  }, []);
+
+  const autoRenameSessionFromPrompt = useCallback((sessionId: string, prompt: string) => {
+    const title = deriveSessionTitleFromPrompt(prompt);
+    if (!title) return;
+
+    setSessions((items) =>
+      items.map((session) => {
+        if (session.id !== sessionId || session.titleSource === "manual" || session.titleSource === "auto") return session;
+        if (!isGenericSessionTitle(session.title)) return session;
+        if (session.title === title) return session;
+
+        return {
+          ...session,
+          title: title.slice(0, 24),
+          titleSource: "auto",
+          updatedAt: new Date().toISOString(),
+        };
+      }),
+    );
+  }, []);
+
+  const deleteSession = useCallback(
+    (sessionId: string) => {
+      setSessions((items) => {
+        const remaining = items.filter((session) => session.id !== sessionId);
+        if (remaining.length === 0) {
+          const fallback = createSession("新会话");
+          setActiveSessionId(fallback.id);
+          return [fallback];
+        }
+        if (activeSessionId === sessionId) {
+          setActiveSessionId(remaining[0].id);
+        }
+        return remaining;
+      });
+    },
+    [activeSessionId],
+  );
+
+  return {
+    activeSessionId,
+    autoRenameSessionFromPrompt,
+    createNewSession,
+    deleteSession,
+    renameSession,
+    sessions,
+    setActiveSessionId,
+  };
+}
+
+function useLocalProfiles(activeSessionId: string) {
+  const [hydrated, setHydrated] = useState(false);
+  const [profilesBySession, setProfilesBySession] = useState<Record<string, StudentProfile>>({});
+
+  useEffect(() => {
+    try {
+      const storedProfiles = localStorage.getItem(PROFILE_STORAGE_KEY);
+      const parsedProfiles = storedProfiles ? (JSON.parse(storedProfiles) as Record<string, StudentProfile>) : {};
+      setProfilesBySession(parsedProfiles && typeof parsedProfiles === "object" ? parsedProfiles : {});
+    } catch {
+      setProfilesBySession({});
+    } finally {
+      setHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profilesBySession));
+  }, [hydrated, profilesBySession]);
+
+  const updateProfileFromPatch = useCallback((sessionId: string, patch: Partial<StudentProfile>) => {
+    if (Object.keys(patch).length === 0) return;
+    setProfilesBySession((current) => ({
+      ...current,
+      [sessionId]: {
+        ...(current[sessionId] ?? {}),
+        ...patch,
+        majorPreference: patch.majorPreference ?? current[sessionId]?.majorPreference,
+        avoidMajors: patch.avoidMajors ?? current[sessionId]?.avoidMajors,
+      },
+    }));
+  }, []);
+
+  const updateProfileFromPrompt = useCallback(
+    (sessionId: string, prompt: string) => {
+      updateProfileFromPatch(sessionId, extractProfileFromPrompt(prompt));
+    },
+    [updateProfileFromPatch],
+  );
+
+  const activeProfile = profilesBySession[activeSessionId] ?? {};
+
+  return {
+    activeProfile,
+    updateProfileFromPatch,
+    updateProfileFromPrompt,
+  };
+}
+
+function useSessionInsights(activeSessionId: string) {
+  const [hydrated, setHydrated] = useState(false);
+  const [summaryBySession, setSummaryBySession] = useState<Record<string, string>>({});
+  const [turnContextBySession, setTurnContextBySession] = useState<Record<string, TurnContext>>({});
+  const [suggestionsBySession, setSuggestionsBySession] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    try {
+      const storedSummary = localStorage.getItem(SUMMARY_STORAGE_KEY);
+      const storedTurnContext = localStorage.getItem(TURN_CONTEXT_STORAGE_KEY);
+      const storedSuggestions = localStorage.getItem(SUGGESTIONS_STORAGE_KEY);
+      setSummaryBySession(storedSummary ? JSON.parse(storedSummary) : {});
+      setTurnContextBySession(storedTurnContext ? JSON.parse(storedTurnContext) : {});
+      setSuggestionsBySession(storedSuggestions ? JSON.parse(storedSuggestions) : {});
+    } catch {
+      setSummaryBySession({});
+      setTurnContextBySession({});
+      setSuggestionsBySession({});
+    } finally {
+      setHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(SUMMARY_STORAGE_KEY, JSON.stringify(summaryBySession));
+    localStorage.setItem(TURN_CONTEXT_STORAGE_KEY, JSON.stringify(turnContextBySession));
+    localStorage.setItem(SUGGESTIONS_STORAGE_KEY, JSON.stringify(suggestionsBySession));
+  }, [hydrated, summaryBySession, suggestionsBySession, turnContextBySession]);
+
+  const upsertTurnContext = useCallback((sessionId: string, turnContext: TurnContext) => {
+    setTurnContextBySession((current) => ({ ...current, [sessionId]: turnContext }));
+    setSummaryBySession((current) => ({ ...current, [sessionId]: turnContext.sessionSummary }));
+    setSuggestionsBySession((current) => ({ ...current, [sessionId]: turnContext.suggestions }));
+  }, []);
+
+  return {
+    activeSessionSummary: summaryBySession[activeSessionId] ?? "",
+    activeTurnContext: turnContextBySession[activeSessionId],
+    activeSuggestions: suggestionsBySession[activeSessionId] ?? [],
+    upsertTurnContext,
+  };
+}
+
+function useMobileVisualViewport() {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const root = document.documentElement;
+    let animationFrame = 0;
+    let focusTimeout = 0;
+    let layoutViewportHeight = Math.round(window.visualViewport?.height ?? window.innerHeight);
+
+    const updateKeyboardInset = () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+
+      animationFrame = window.requestAnimationFrame(() => {
+        const viewport = window.visualViewport;
+        const viewportHeight = viewport?.height ?? window.innerHeight;
+        const offsetTop = viewport?.offsetTop ?? 0;
+        const activeElement = document.activeElement;
+        const isTextInputFocused =
+          activeElement instanceof HTMLTextAreaElement ||
+          activeElement instanceof HTMLInputElement;
+
+        if (!isTextInputFocused) {
+          layoutViewportHeight = Math.max(
+            layoutViewportHeight,
+            Math.round(viewportHeight + offsetTop),
+            window.innerHeight,
+          );
+          root.style.setProperty("--gaokao-layout-height", `${layoutViewportHeight}px`);
+        }
+
+        const keyboardInset = Math.max(
+          0,
+          Math.round(layoutViewportHeight - viewportHeight - offsetTop),
+        );
+
+        root.style.setProperty("--gaokao-keyboard-inset", `${keyboardInset}px`);
+        root.classList.toggle("gaokao-keyboard-open", isTextInputFocused);
+        window.scrollTo(0, 0);
+      });
+    };
+
+    const scheduleViewportUpdate = (event?: Event) => {
+      updateKeyboardInset();
+      window.clearTimeout(focusTimeout);
+      focusTimeout = window.setTimeout(() => {
+        updateKeyboardInset();
+        if (event?.target instanceof HTMLTextAreaElement) window.scrollTo(0, 0);
+      }, 250);
+    };
+
+    updateKeyboardInset();
+    root.style.setProperty("--gaokao-layout-height", `${layoutViewportHeight}px`);
+    window.addEventListener("resize", updateKeyboardInset);
+    window.addEventListener("orientationchange", scheduleViewportUpdate);
+    window.addEventListener("focusin", scheduleViewportUpdate);
+    window.addEventListener("focusout", scheduleViewportUpdate);
+    window.visualViewport?.addEventListener("resize", updateKeyboardInset);
+    window.visualViewport?.addEventListener("scroll", updateKeyboardInset);
+
+    return () => {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      window.clearTimeout(focusTimeout);
+      window.removeEventListener("resize", updateKeyboardInset);
+      window.removeEventListener("orientationchange", scheduleViewportUpdate);
+      window.removeEventListener("focusin", scheduleViewportUpdate);
+      window.removeEventListener("focusout", scheduleViewportUpdate);
+      window.visualViewport?.removeEventListener("resize", updateKeyboardInset);
+      window.visualViewport?.removeEventListener("scroll", updateKeyboardInset);
+      root.style.removeProperty("--gaokao-keyboard-inset");
+      root.style.removeProperty("--gaokao-layout-height");
+      root.classList.remove("gaokao-keyboard-open");
+    };
+  }, []);
+}
+
+function insertPrompt(message: string) {
+  const textarea = document.querySelector<HTMLTextAreaElement>("textarea");
+  if (!textarea) return;
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(textarea, message);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
+function getCopilotChatInputElements() {
+  return {
+    sendButton: document.querySelector<HTMLButtonElement>('[data-testid="copilot-send-button"]'),
+    textarea: document.querySelector<HTMLTextAreaElement>('[data-testid="copilot-chat-textarea"]'),
+  };
+}
+
+function useAutoSessionTitle(
+  activeSessionId: string,
+  onPromptSubmitted: (sessionId: string, prompt: string) => void,
+) {
+  const lastPromptRef = useRef("");
+  const lastCapturedAtRef = useRef(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let attachedTextarea: HTMLTextAreaElement | null = null;
+    let attachedButton: HTMLButtonElement | null = null;
+    let detachHandlers: (() => void)[] = [];
+
+    const capturePrompt = () => {
+      const { textarea } = getCopilotChatInputElements();
+      const prompt = textarea?.value.trim();
+      if (!prompt) return;
+
+      const now = Date.now();
+      if (prompt === lastPromptRef.current && now - lastCapturedAtRef.current < 1000) return;
+      lastPromptRef.current = prompt;
+      lastCapturedAtRef.current = now;
+      flushSync(() => {
+        onPromptSubmitted(activeSessionId, prompt);
+      });
+    };
+
+    const attach = () => {
+      const { sendButton, textarea } = getCopilotChatInputElements();
+      if (attachedTextarea === textarea && attachedButton === sendButton) return;
+
+      detachHandlers.forEach((detach) => detach());
+      detachHandlers = [];
+      attachedTextarea = textarea;
+      attachedButton = sendButton;
+
+      if (!textarea || !sendButton) return;
+
+      const handleSendClick = () => capturePrompt();
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+        capturePrompt();
+      };
+
+      sendButton.addEventListener("click", handleSendClick, true);
+      textarea.addEventListener("keydown", handleKeyDown, true);
+
+      detachHandlers.push(
+        () => sendButton.removeEventListener("click", handleSendClick, true),
+        () => textarea.removeEventListener("keydown", handleKeyDown, true),
+      );
+    };
+
+    const attachTimer = window.setTimeout(attach, 0);
+    const observer = new MutationObserver(attach);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    return () => {
+      window.clearTimeout(attachTimer);
+      observer.disconnect();
+      detachHandlers.forEach((detach) => detach());
+    };
+  }, [activeSessionId, onPromptSubmitted]);
+}
+
+function useMobileSendBridge(activeSessionId: string) {
+  const lastMobileSubmitAtRef = useRef(0);
+
+  const triggerMobileSend = useCallback(() => {
+    if (typeof window === "undefined") return false;
+
+    const { sendButton, textarea } = getCopilotChatInputElements();
+    if (!sendButton || !textarea || sendButton.disabled || textarea.value.trim().length === 0) {
+      return false;
+    }
+
+    const now = Date.now();
+    if (now - lastMobileSubmitAtRef.current < 700) {
+      return false;
+    }
+    lastMobileSubmitAtRef.current = now;
+
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    sendButton.click();
+    textarea.focus({ preventScroll: true });
+    window.scrollTo(0, 0);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let attachedTextarea: HTMLTextAreaElement | null = null;
+    let attachedButton: HTMLButtonElement | null = null;
+    let detachHandlers: (() => void)[] = [];
+
+    const isCoarsePointer = () =>
+      window.matchMedia?.("(hover: none) and (pointer: coarse)").matches ?? false;
+
+    const attach = () => {
+      const { sendButton, textarea } = getCopilotChatInputElements();
+      if (attachedTextarea === textarea && attachedButton === sendButton) {
+        return;
+      }
+
+      detachHandlers.forEach((detach) => detach());
+      detachHandlers = [];
+      attachedTextarea = textarea;
+      attachedButton = sendButton;
+
+      if (!textarea || !sendButton) {
+        return;
+      }
+
+      textarea.enterKeyHint = "send";
+      textarea.setAttribute("enterkeyhint", "send");
+      textarea.setAttribute("autocomplete", "off");
+      textarea.setAttribute("autocapitalize", "sentences");
+
+      const handleMobileSendPointer = (event: Event) => {
+        if (!isCoarsePointer()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        triggerMobileSend();
+      };
+
+      sendButton.addEventListener("touchend", handleMobileSendPointer, { passive: false });
+      sendButton.addEventListener("pointerup", handleMobileSendPointer);
+
+      detachHandlers.push(
+        () => sendButton.removeEventListener("touchend", handleMobileSendPointer),
+        () => sendButton.removeEventListener("pointerup", handleMobileSendPointer),
+      );
+    };
+
+    const attachTimer = window.setTimeout(attach, 0);
+    const observer = new MutationObserver(attach);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    return () => {
+      window.clearTimeout(attachTimer);
+      observer.disconnect();
+      detachHandlers.forEach((detach) => detach());
+    };
+  }, [activeSessionId, triggerMobileSend]);
+
+  return { triggerMobileSend };
+}
+
+function ProfileStrip({
+  profile,
+  missingPriority = [],
+}: {
+  profile: StudentProfile;
+  missingPriority?: Array<keyof StudentProfile>;
+}) {
+  const knownFields = PROFILE_FIELDS.map(({ key }) => ({
+    key,
+    value: profileLabelValue(profile, key),
+  })).filter((item) => item.value && item.key !== "updatedAt");
+  const missingFields = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
+  const missingByKey = new Map(PROFILE_FIELDS.map((field) => [field.key, field]));
+
+  return (
+    <div className="mt-2 border-t border-zinc-100 bg-zinc-50/70 px-1 pt-2">
+      <div className="grid gap-2">
+        <section className="min-w-0">
+          <div className="mb-1 flex items-center gap-2 px-0.5">
+            <p className="shrink-0 text-[11px] font-semibold text-zinc-500">当前画像</p>
+            <div className="h-px flex-1 bg-zinc-200" />
+          </div>
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
+            {knownFields.length ? (
+              knownFields.map((item) => <ProfilePill key={String(item.key)}>{item.value}</ProfilePill>)
+            ) : (
+              <ProfilePill muted onClick={() => insertPrompt("我先补充一下我的高考省份、科类、分数、位次和家庭预算：")}>
+                暂无画像
+              </ProfilePill>
+            )}
+          </div>
+        </section>
+        <section className="min-w-0">
+          <div className="mb-1 flex items-center gap-2 px-0.5">
+            <p className="shrink-0 text-[11px] font-semibold text-zinc-500">待补画像</p>
+            <div className="h-px flex-1 border-t border-dashed border-zinc-300" />
+          </div>
+          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
+            {missingFields.length ? (
+              missingFields.map((key, index) => {
+                const field = missingByKey.get(key);
+                if (!field) return null;
+                return (
+                  <ProfilePill
+                    key={`missing-strip-${field.key}`}
+                    muted
+                    highlight={index === 0}
+                    onClick={() => insertPrompt(field.question)}
+                  >
+                    {field.label}待补
+                  </ProfilePill>
+                );
+              })
+            ) : (
+              <ProfilePill muted>关键项已补齐</ProfilePill>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function SuggestionBar({ suggestions }: { suggestions: string[] }) {
+  if (!suggestions.length) return null;
+
+  return (
+    <div className="gaokao-suggestion-bar" aria-label="建议回复">
+      <div className="flex gap-1.5 overflow-x-auto px-3 py-2">
+        {suggestions.slice(0, 8).map((suggestion, index) => (
+          <button
+            key={`${suggestion}-${index}`}
+            type="button"
+            onClick={() => insertPrompt(suggestion)}
+            className={`shrink-0 rounded-md border px-2.5 py-1.5 text-xs shadow-sm ${
+              index === 0
+                ? "border-red-200 bg-red-50 font-semibold text-red-800"
+                : "border-zinc-200 bg-white text-zinc-700"
+            }`}
+          >
+            {suggestion}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AdvisorChatSurface() {
+  useMobileVisualViewport();
+
+  const {
+    activeSessionId,
+    autoRenameSessionFromPrompt,
+    createNewSession,
+    deleteSession,
+    renameSession,
+    sessions,
+    setActiveSessionId,
+  } = useLocalSessions();
+  const { activeProfile, updateProfileFromPatch } = useLocalProfiles(activeSessionId);
+  const {
+    activeSessionSummary,
+    activeTurnContext,
+    activeSuggestions,
+    upsertTurnContext,
+  } = useSessionInsights(activeSessionId);
+  const rankHydrationKeyRef = useRef("");
+  const hydrateRankForTurnContext = useCallback(
+    (sessionId: string, turnContext: TurnContext, lastAssistantText: string) => {
+      if (!canAutoHydrateRank(turnContext.profileAfterTurn)) return;
+      void requestRankHydration(turnContext.profileAfterTurn)
+        .then((rankResult) => {
+          if (!rankResult) return;
+          const nextTurnContext = mergeRankHydrationIntoTurnContext(
+            turnContext,
+            rankResult,
+            lastAssistantText,
+          );
+          updateProfileFromPatch(sessionId, {
+            rank: rankResult.rank,
+            subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
+            updatedAt: nextTurnContext.updatedAt,
+          });
+          upsertTurnContext(sessionId, nextTurnContext);
+        })
+        .catch(() => undefined);
+    },
+    [updateProfileFromPatch, upsertTurnContext],
+  );
+  const handlePromptSubmitted = useCallback(
+    (sessionId: string, prompt: string) => {
+      const lastAssistantText = readLastAssistantText();
+      const localTurnContext = buildLocalTurnContext({
+        prompt,
+        profile: activeProfile,
+        previousSummary: activeSessionSummary,
+        lastAssistantText,
+      });
+      autoRenameSessionFromPrompt(sessionId, prompt);
+      updateProfileFromPatch(sessionId, localTurnContext.profilePatch);
+      upsertTurnContext(sessionId, localTurnContext);
+      hydrateRankForTurnContext(sessionId, localTurnContext, lastAssistantText);
+
+      if (shouldUseRemotePreprocess(prompt)) {
+        void requestRemotePreprocess({
+          threadId: sessionId,
+          rawPrompt: prompt,
+          profile: mergeProfile(activeProfile, localTurnContext.profilePatch),
+          previousSummary: activeSessionSummary,
+          lastAssistantText,
+        })
+          .then((remote) => {
+            const mergedTurnContext = mergeRemoteTurnContext(localTurnContext, remote, activeProfile);
+            updateProfileFromPatch(sessionId, mergedTurnContext.profilePatch);
+            upsertTurnContext(sessionId, mergedTurnContext);
+            hydrateRankForTurnContext(sessionId, mergedTurnContext, lastAssistantText);
+          })
+          .catch(() => {
+            upsertTurnContext(sessionId, {
+              ...localTurnContext,
+              ambiguityWarnings: uniqueTextItems([
+                ...localTurnContext.ambiguityWarnings,
+                "远程预处理暂不可用，已使用本地规则画像。",
+              ]),
+            });
+          });
+      }
+    },
+    [
+      activeProfile,
+      activeSessionSummary,
+      autoRenameSessionFromPrompt,
+      hydrateRankForTurnContext,
+      updateProfileFromPatch,
+      upsertTurnContext,
+    ],
+  );
+  useAutoSessionTitle(activeSessionId, handlePromptSubmitted);
+  const { triggerMobileSend } = useMobileSendBridge(activeSessionId);
+
+  const activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
+  const displayActiveProfile = withDerivedProfile(activeProfile);
+  const authoritativeProfile = withDerivedProfile(activeTurnContext?.profileAfterTurn ?? activeProfile);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+
+  useEffect(() => {
+    const hydrationKey = [
+      activeSessionId,
+      authoritativeProfile.province ?? "",
+      normalizeRankHydrationSubject(authoritativeProfile),
+      authoritativeProfile.score ?? "",
+      authoritativeProfile.rank ?? "",
+    ].join(":");
+
+    if (!canAutoHydrateRank(authoritativeProfile) || rankHydrationKeyRef.current === hydrationKey) return;
+    rankHydrationKeyRef.current = hydrationKey;
+
+    void requestRankHydration(authoritativeProfile)
+      .then((rankResult) => {
+        if (!rankResult) return;
+        const baseTurnContext =
+          activeTurnContext ??
+          buildLocalTurnContext({
+            prompt: "",
+            profile: authoritativeProfile,
+            previousSummary: activeSessionSummary,
+            lastAssistantText: readLastAssistantText(),
+          });
+        const nextTurnContext = mergeRankHydrationIntoTurnContext(
+          baseTurnContext,
+          rankResult,
+          readLastAssistantText(),
+        );
+        updateProfileFromPatch(activeSessionId, {
+          rank: rankResult.rank,
+          subjectTrack: authoritativeProfile.subjectTrack || rankResult.subjectTrack,
+          updatedAt: nextTurnContext.updatedAt,
+        });
+        upsertTurnContext(activeSessionId, nextTurnContext);
+      })
+      .catch(() => undefined);
+  }, [
+    activeSessionId,
+    activeSessionSummary,
+    activeTurnContext,
+    authoritativeProfile.province,
+    authoritativeProfile.rank,
+    authoritativeProfile.score,
+    authoritativeProfile.subjectTrack,
+    updateProfileFromPatch,
+    upsertTurnContext,
+  ]);
+
+  const startRenamingSession = useCallback(() => {
+    setRenameDraft(activeSession?.title ?? "志愿填报");
+    setRenamingSessionId(activeSessionId);
+  }, [activeSession?.title, activeSessionId]);
+
+  const commitRenamingSession = useCallback(() => {
+    if (!renamingSessionId) return;
+    renameSession(renamingSessionId, renameDraft);
+    setRenamingSessionId(null);
+    setRenameDraft("");
+  }, [renameDraft, renameSession, renamingSessionId]);
+
+  const cancelRenamingSession = useCallback(() => {
+    setRenamingSessionId(null);
+    setRenameDraft("");
+  }, []);
+
+  useAgentContext({
+    description: "当前产品形态和会话",
+    value:
+      `手机端高考志愿聊天 agent。当前 threadId=${activeSessionId}。` +
+      `${GAOKAO_STAGE_CONTEXT}` +
+      "这是一个独立本地会话，只能使用当前 threadId 的消息和当前本地画像，不要引用其他会话的画像或偏好。" +
+      "不要让用户填表，直接通过自然对话收集高考省份、科类、分数、位次、家庭预算、目标城市/地区偏好、读研意愿和风险偏好。" +
+      "高考省份是考生参加高考和投档的省份；目标城市/地区是想去读大学的地方，二者不能混用。" +
+      "当前权威画像优先级最高；如果它与历史聊天、会话摘要或旧工具结果冲突，必须以当前权威画像为准。例如当前权威画像 score=530 时，历史里出现过 590 也必须忽略 590。" +
+      "如果当前权威画像已有高考省份、科类/类别和分数但缺位次，前端会尝试用本地一分一段结构化库自动补全 rank；补全后的 rank 必须作为当前画像使用。" +
+      `当前权威画像：${JSON.stringify(authoritativeProfile)}。` +
+      `当前本地画像：${JSON.stringify(displayActiveProfile)}。` +
+      `画像缺失项：${getMissingProfileFields(authoritativeProfile)
+        .map((field) => field.label)
+        .join("、") || "无"}。` +
+      `当前会话摘要：${activeSessionSummary || "暂无"}。` +
+      `本轮关键信息：${JSON.stringify(activeTurnContext ?? null)}。` +
+      `建议回复模板：${activeSuggestions.join("；") || "暂无"}。`,
+  });
+
+  useComponent({
+    name: "studentProfileSummary",
+    description: "展示当前考生画像、缺失字段和下一步追问。适合在规划类问题追问前或补齐画像后使用。",
+    parameters: studentProfileSummarySchema,
+    render: StudentProfileSummary,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "scoreLineTrendChart",
+    description:
+      "在聊天中展示院校分数线趋势或专业组对比。用户问分数线、录取线、投档线、近三年、趋势、走势、历年或具体分数时，若能查到年份、分数和来源，就应主动渲染本组件，不必等待用户说画图。支持普通类、艺术类、美术类和综合分；数据可来自官方来源、可核验第三方聚合来源或用户明确提供的数据；第三方数据必须在 sources/warnings 中标注，不能用猜测数据绘图。",
+    parameters: scoreLineTrendChartSchema,
+    render: ScoreLineTrendChart,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "volunteerPlanCards",
+    description: "展示高考志愿冲稳保分层方案。卡片必须基于画像、分数线证据或明确说明缺口，不输出表格。",
+    parameters: volunteerPlanCardsSchema,
+    render: VolunteerPlanCards,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "admissionRiskCards",
+    description: "展示普通家庭或特定考生的专业/院校风险：不建议碰、谨慎、可考虑。",
+    parameters: admissionRiskCardsSchema,
+    render: AdmissionRiskCards,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "schoolComparisonCard",
+    description: "对比 2-3 所学校的分数风险、城市价值、专业适配、就业路径和家庭适配。",
+    parameters: schoolComparisonCardSchema,
+    render: SchoolComparisonCard,
+    followUp: true,
+  });
+
+  const toolsMenu = useMemo<(ToolsMenuItem | "-")[]>(
+    () => [
+      {
+        label: "查 2025 苏州大学江苏物理类",
+        action: () =>
+          insertPrompt("2025 苏州大学江苏物理类分数线是什么？请先查官方数据，再画图。"),
+      },
+      {
+        label: "看苏州大学近三年趋势",
+        action: () => insertPrompt("苏州大学近三年江苏物理类最低门槛趋势怎么样？"),
+      },
+      "-",
+      {
+        label: "按普通家庭追问画像",
+        action: () => insertPrompt("我江苏物理类 580，家里普通，怎么选专业？"),
+      },
+    ],
+    [],
+  );
+
+  return (
+    <div className="gaokao-agent-shell mx-auto flex h-dvh min-h-0 w-full max-w-[480px] flex-col overflow-hidden bg-white text-zinc-950 shadow-2xl shadow-zinc-200/60">
+      <header className="border-b border-zinc-200 bg-white px-3 pb-3 pt-3">
+        <div className="flex items-center gap-2">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-red-700 text-white">
+            <Icon name="message" className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h1 className="truncate text-base font-semibold">高考志愿填报 Agent</h1>
+            <p className="truncate text-xs text-zinc-500">官方数据优先 · DeepSeek · 2026 时间记忆</p>
+          </div>
+          <button
+            type="button"
+            onClick={createNewSession}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-800 hover:bg-zinc-50"
+            aria-label="新会话"
+            title="新会话"
+          >
+            <Icon name="plus" />
+          </button>
+        </div>
+
+        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+          {sessions.map((session) => {
+            const isActive = session.id === activeSessionId;
+            return (
+              <button
+                key={session.id}
+                type="button"
+                onClick={() => setActiveSessionId(session.id)}
+                aria-pressed={isActive}
+                className={`shrink-0 rounded-md border px-3 py-1.5 text-xs font-medium transition ${
+                  isActive
+                    ? "border-zinc-950 bg-zinc-950 text-white"
+                    : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                {session.title}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-2 flex items-center justify-between gap-2 text-xs text-zinc-500">
+          {renamingSessionId === activeSessionId ? (
+            <form
+              className="min-w-0 flex-1"
+              onSubmit={(event) => {
+                event.preventDefault();
+                commitRenamingSession();
+              }}
+            >
+              <input
+                autoFocus
+                value={renameDraft}
+                onBlur={commitRenamingSession}
+                onChange={(event) => setRenameDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelRenamingSession();
+                  }
+                }}
+                className="h-7 w-full rounded border border-zinc-300 bg-white px-2 text-xs text-zinc-900 outline-none focus:border-red-700"
+                aria-label="会话名称"
+                maxLength={24}
+              />
+            </form>
+          ) : (
+            <span className="truncate">当前：{activeSession?.title ?? "志愿填报"}</span>
+          )}
+          <div className="flex shrink-0 gap-1">
+            <button
+              type="button"
+              onClick={startRenamingSession}
+              className="flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50"
+              aria-label="重命名当前会话"
+              title="重命名"
+            >
+              <Icon name="edit" className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => deleteSession(activeSessionId)}
+              className="flex h-7 w-7 items-center justify-center rounded border border-zinc-200 text-red-700 hover:bg-red-50"
+              aria-label="删除当前会话"
+              title="删除"
+            >
+              <Icon name="trash" className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+
+        <ProfileStrip profile={displayActiveProfile} missingPriority={activeTurnContext?.missingPriority} />
+      </header>
+
+      <main className="min-h-0 flex-1 overflow-hidden">
+        <CopilotChat
+          agentId="default"
+          className="gaokao-chat h-full"
+          threadId={activeSessionId}
+          key={activeSessionId}
+          labels={{
+            chatInputPlaceholder: activeSuggestions[0] || "直接问：海南高考 680 分能去什么学校？",
+            chatDisclaimerText: "重要志愿决策请以省考试院和院校官方数据为准。",
+            welcomeMessageText:
+              "我是志愿填报 agent，会先聊清楚省份、科类、分数、位次和家庭约束。问分数线时我会先查官方数据，再用图表说话。",
+            modalHeaderTitle: "高考志愿填报 Agent",
+          }}
+          input={{
+            showDisclaimer: true,
+            autoFocus: false,
+            toolsMenu,
+          }}
+          welcomeScreen={{
+            className: "px-4",
+          }}
+        />
+      </main>
+
+      <SuggestionBar suggestions={activeSuggestions} />
+
+      <button
+        type="button"
+        className="gaokao-mobile-send-fallback"
+        onPointerDown={(event) => event.preventDefault()}
+        onPointerUp={(event) => {
+          event.preventDefault();
+          triggerMobileSend();
+        }}
+        onTouchEnd={(event) => {
+          event.preventDefault();
+          triggerMobileSend();
+        }}
+        aria-label="发送消息"
+      >
+        <Icon name="send" className="h-5 w-5" />
+      </button>
+    </div>
+  );
+}
+
+export default function Home() {
+  const wildcardRenderer = defineToolCallRenderer({
+    name: "*",
+    render: ({ name, args, status }) => <ToolReasoning name={name} args={args} status={status} />,
+  });
+
+  return (
+    <CopilotKitProvider
+      runtimeUrl="/api/copilotkit"
+      renderToolCalls={[wildcardRenderer]}
+      showDevConsole={false}
+      onError={({ error }) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (/AbortError|BodyStreamBuffer was aborted/i.test(message)) return;
+        console.error("[Gaokao Advisor] CopilotKit error", error);
+      }}
+    >
+      <AdvisorChatSurface />
+    </CopilotKitProvider>
+  );
+}

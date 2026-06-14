@@ -7,12 +7,18 @@
   color-scheme: light;
 }
 
+*,
+::before,
+::after {
+  box-sizing: border-box;
+}
+
 html,
 body {
   height: 100%;
   min-height: 100%;
-  background: #f4f4f5;
   overflow: hidden;
+  background: #eaf1ff;
 }
 
 body {
@@ -30,57 +36,205 @@ body {
   transform: translateX(-50%);
 }
 
-.gaokao-agent-shell > main,
-.gaokao-chat {
-  min-height: 0;
-  overflow: hidden;
+.gaokao-agent-shell * {
+  letter-spacing: 0;
 }
 
-.gaokao-chat [data-testid="copilot-input-overlay"] {
-  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--gaokao-keyboard-inset, 0px));
-  z-index: 60;
+.gaokao-dashboard-scroll {
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: smooth;
+}
+
+.gaokao-dashboard-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.gaokao-dashboard-scroll section.mx-4 {
+  width: min(448px, calc(100vw - 32px));
+  max-width: min(448px, calc(100vw - 32px));
+}
+
+.gaokao-text-composer {
+  position: fixed;
+  right: max(12px, calc((100vw - 480px) / 2 + 12px));
+  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--gaokao-keyboard-inset, 0px) + 12px);
+  left: max(12px, calc((100vw - 480px) / 2 + 12px));
+  z-index: 80;
   transition: bottom 160ms ease-out;
 }
 
-@media (hover: none) and (pointer: coarse) {
-  .gaokao-keyboard-open .gaokao-chat [data-testid="copilot-input-overlay"] {
-    bottom: calc(
-      env(safe-area-inset-bottom, 0px) +
-        max(var(--gaokao-keyboard-inset, 0px), min(42vh, 360px))
-    );
-  }
-
-  .gaokao-mobile-send-fallback {
-    display: flex;
-  }
-
-  .gaokao-keyboard-open .gaokao-mobile-send-fallback {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateY(0);
-  }
-}
-
-.gaokao-chat [data-testid="copilot-chat-input"] {
-  box-shadow: 0 10px 30px rgb(0 0 0 / 0.12);
-}
-
-.gaokao-chat [data-testid="copilot-scroll-content"] {
-  padding-bottom: calc(
-    max(var(--gaokao-chat-bottom-reserve, 184px), 184px) +
-      var(--gaokao-keyboard-inset, 0px)
-  ) !important;
-}
-
-.gaokao-suggestion-bar {
-  bottom: calc(env(safe-area-inset-bottom, 0px) + var(--gaokao-keyboard-inset, 0px) + 116px);
-  left: 50%;
-  max-width: 480px;
-  pointer-events: auto;
+.gaokao-floating-suggestions {
   position: fixed;
-  transform: translateX(-50%);
+  right: max(12px, calc((100vw - 480px) / 2 + 12px));
+  bottom: calc(
+    env(safe-area-inset-bottom, 0px) +
+      var(--gaokao-keyboard-inset, 0px) +
+      var(--gaokao-composer-height, 88px) + 16px
+  );
+  left: max(12px, calc((100vw - 480px) / 2 + 12px));
+  z-index: 72;
+  overflow: hidden;
+  border: 1px solid #dbeafe;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.96);
+  box-shadow: 0 14px 32px rgb(15 23 42 / 0.09);
+  transition: bottom 160ms ease-out;
+}
+
+.gaokao-chat {
+  --copilot-kit-primary-color: #2563eb;
+  --copilot-kit-contrast-color: #ffffff;
+  min-height: 0;
   width: 100%;
-  z-index: 58;
+  max-width: 100%;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.gaokao-chat-layer {
+  margin-top: -4px;
+  max-width: calc(100vw - 32px);
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+
+.gaokao-visible-chat-wrap {
+  height: min(620px, 72vh);
+  min-height: 360px;
+  overflow: hidden;
+  max-width: 100%;
+  background: transparent !important;
+}
+
+.gaokao-visible-chat {
+  height: 100% !important;
+  min-height: 0;
+  overflow: hidden !important;
+  background: transparent !important;
+}
+
+.gaokao-chat [data-copilotkit],
+.gaokao-chat .copilotKitMessages,
+.gaokao-chat [data-testid="copilot-message-list"] {
+  max-width: 100% !important;
+  min-width: 0 !important;
+  background: transparent !important;
+  color-scheme: light;
+}
+
+.gaokao-chat [data-testid="copilot-message-list"] {
+  gap: 0.75rem;
+  overflow-x: hidden !important;
+  padding-inline: 0 !important;
+}
+
+.gaokao-chat [data-testid="copilot-scroll-content"],
+.gaokao-chat [data-testid="copilot-scroll-content"] > div {
+  min-height: 0 !important;
+  max-width: 100% !important;
+  overflow-x: hidden !important;
+}
+
+.gaokao-chat .copilotKitMessage,
+.gaokao-chat [data-testid="copilot-assistant-message"],
+.gaokao-chat [data-testid="copilot-user-message"] {
+  max-width: 100% !important;
+  min-width: 0 !important;
+  overflow-x: hidden !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: #172033 !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] {
+  width: 100% !important;
+  padding-inline: 0 !important;
+  position: relative;
+  z-index: 1;
+}
+
+.gaokao-chat [data-testid="copilot-user-message"] {
+  width: 100% !important;
+  align-items: flex-end !important;
+  padding-top: 0.5rem !important;
+  padding-inline: 0 !important;
+  position: relative;
+  z-index: 1;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] > div,
+.gaokao-chat [data-testid="copilot-user-message"] > div,
+.gaokao-chat [data-testid="copilot-assistant-message"] [class~="cpk:prose"],
+.gaokao-chat [data-testid="copilot-user-message"] [class~="cpk:prose"] {
+  max-width: 100% !important;
+  min-width: 0 !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.gaokao-chat [data-testid="copilot-user-message"] > :not(:empty) {
+  max-width: min(86%, 360px) !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="space-y-4"] > p:last-of-type:not(:first-child) {
+  margin-top: 1.15rem !important;
+  border-left: 3px solid rgb(37 99 235 / 0.75);
+  border-radius: 12px;
+  background: rgb(239 246 255 / 0.78);
+  padding: 0.75rem 0.85rem !important;
+  box-shadow: inset 0 0 0 1px rgb(191 219 254 / 0.7);
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="space-y-4"] > p:last-of-type:not(:first-child)::first-line {
+  color: #1d4ed8;
+  font-weight: 900;
+}
+
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-slate"],
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-zinc"],
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-neutral"],
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-gray"],
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="bg-slate"],
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="bg-zinc"],
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="bg-neutral"],
+.gaokao-chat [data-testid="copilot-assistant-message"] [class*="bg-gray"] {
+  background-color: transparent !important;
+}
+
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-primary"],
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-blue"],
+.gaokao-chat [data-testid="copilot-user-message"] [class*="bg-red"] {
+  background-color: rgb(255 255 255 / 0.74) !important;
+  color: #172033 !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] pre,
+.gaokao-chat [data-testid="copilot-assistant-message"] code,
+.gaokao-chat [data-testid="copilot-user-message"] pre,
+.gaokao-chat [data-testid="copilot-user-message"] code {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] img,
+.gaokao-chat [data-testid="copilot-assistant-message"] svg,
+.gaokao-chat [data-testid="copilot-user-message"] img,
+.gaokao-chat [data-testid="copilot-user-message"] svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.gaokao-chat [data-testid="copilot-input-overlay"] {
+  position: absolute !important;
+  left: -9999px !important;
+  bottom: auto !important;
+  width: 420px !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 .gaokao-chat [data-testid="copilot-chat-textarea"] {
@@ -93,54 +247,105 @@ body {
 .gaokao-chat [data-testid="copilot-send-button"] {
   min-height: 44px !important;
   min-width: 44px !important;
-  position: relative;
-  z-index: 70;
   touch-action: manipulation;
-  -webkit-tap-highlight-color: transparent;
 }
 
-.gaokao-mobile-send-fallback {
-  align-items: center;
-  background: #b91c1c;
-  border: 1px solid rgb(127 29 29 / 0.2);
-  border-radius: 999px;
-  bottom: calc(
-    env(safe-area-inset-bottom, 0px) +
-      max(var(--gaokao-keyboard-inset, 0px), min(42vh, 360px)) + 58px
-  );
-  box-shadow: 0 12px 28px rgb(127 29 29 / 0.28);
-  color: #fff;
-  display: none;
-  height: 46px;
-  justify-content: center;
-  opacity: 0;
-  pointer-events: none;
-  position: fixed;
-  right: max(18px, calc((100vw - 480px) / 2 + 18px));
-  transform: translateY(8px);
-  transition:
-    opacity 120ms ease-out,
-    transform 120ms ease-out;
-  width: 46px;
-  z-index: 120;
-}
-
-.gaokao-mobile-send-fallback:active {
-  transform: translateY(9px) scale(0.97);
+.gaokao-chat [data-testid="copilot-scroll-content"] {
+  padding-bottom: 28px !important;
 }
 
 .gaokao-chat {
-  --copilot-kit-primary-color: #b91c1c;
-  --copilot-kit-contrast-color: #ffffff;
+  --gaokao-scroll-button-right: max(24px, calc((100vw - 480px) / 2 + 28px));
 }
 
-.gaokao-chat * {
-  letter-spacing: 0;
+.gaokao-chat div:has(> [data-testid="copilot-scroll-to-bottom"]) {
+  position: fixed !important;
+  inset: auto var(--gaokao-scroll-button-right)
+    calc(
+      env(safe-area-inset-bottom, 0px) +
+        var(--gaokao-keyboard-inset, 0px) +
+        var(--gaokao-composer-height, 88px) + 74px
+    )
+    auto !important;
+  display: block !important;
+  width: 48px !important;
+  height: 48px !important;
+  z-index: 78 !important;
+  pointer-events: none !important;
 }
 
-.gaokao-chat [data-testid="copilot-assistant-message"] strong {
-  color: #991b1b;
-  font-weight: 750;
+@keyframes gaokao-scroll-bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes gaokao-action-bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+.gaokao-school-score-button {
+  animation: gaokao-action-bounce 1.45s ease-in-out infinite;
+}
+
+.gaokao-chat [data-testid="copilot-scroll-to-bottom"],
+.gaokao-chat button[aria-label*="bottom" i],
+.gaokao-chat button[aria-label*="底部"],
+.gaokao-chat button[aria-label*="下方"] {
+  position: fixed !important;
+  right: var(--gaokao-scroll-button-right) !important;
+  bottom: calc(
+    env(safe-area-inset-bottom, 0px) +
+      var(--gaokao-keyboard-inset, 0px) +
+      var(--gaokao-composer-height, 88px) + 74px
+  ) !important;
+  display: grid !important;
+  width: 48px !important;
+  height: 48px !important;
+  min-width: 48px !important;
+  min-height: 48px !important;
+  place-items: center !important;
+  border: 2px solid rgb(37 99 235 / 0.72) !important;
+  border-radius: 9999px !important;
+  background: rgb(219 234 254 / 0.5) !important;
+  box-shadow: 0 12px 28px rgb(37 99 235 / 0.2) !important;
+  color: #2563eb !important;
+  backdrop-filter: blur(8px);
+  animation: gaokao-scroll-bounce 1.25s ease-in-out infinite;
+  z-index: 78 !important;
+}
+
+.gaokao-chat [data-testid="copilot-scroll-to-bottom"] {
+  position: relative !important;
+  right: auto !important;
+  bottom: auto !important;
+  pointer-events: auto !important;
+}
+
+.gaokao-chat [data-testid="copilot-scroll-to-bottom"] svg,
+.gaokao-chat button[aria-label*="bottom" i] svg,
+.gaokao-chat button[aria-label*="底部"] svg,
+.gaokao-chat button[aria-label*="下方"] svg {
+  width: 22px !important;
+  height: 22px !important;
+  color: currentColor !important;
+}
+
+.gaokao-chat [aria-label*="voice" i],
+.gaokao-chat [aria-label*="mic" i],
+.gaokao-chat [aria-label*="语音"],
+.gaokao-chat [aria-label*="麦克风"] {
+  display: none !important;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] table {
@@ -168,15 +373,15 @@ body {
 .gaokao-chat [data-testid="copilot-assistant-message"] tr {
   margin: 0.5rem 0;
   overflow: hidden;
-  border: 1px solid #e4e4e7 !important;
-  border-radius: 0.5rem;
+  border: 1px solid #dbeafe !important;
+  border-radius: 0.75rem;
   background: #fff;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] th,
 .gaokao-chat [data-testid="copilot-assistant-message"] td {
   border: 0 !important;
-  border-bottom: 1px solid #f4f4f5 !important;
+  border-bottom: 1px solid #eff6ff !important;
   padding: 0.5rem 0.65rem !important;
   word-break: break-word;
 }

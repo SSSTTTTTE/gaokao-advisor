@@ -7,8 +7,25 @@ import {
   useAgentContext,
   useComponent,
 } from "@copilotkit/react-core/v2";
+import {
+  AcademicCapIcon,
+  AdjustmentsHorizontalIcon,
+  ArrowDownTrayIcon,
+  BookOpenIcon,
+  BuildingLibraryIcon,
+  CheckBadgeIcon,
+  CpuChipIcon,
+  MapPinIcon,
+  PaperAirplaneIcon,
+  PencilSquareIcon,
+  RocketLaunchIcon,
+  ShieldCheckIcon,
+  StarIcon,
+  TrophyIcon,
+  WalletIcon,
+} from "@heroicons/react/24/outline";
 import type { ToolsMenuItem } from "@copilotkit/react-core/v2";
-import type { ReactNode } from "react";
+import type { MutableRefObject, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { z } from "zod";
@@ -21,6 +38,9 @@ const PROFILE_STORAGE_KEY = "gaokao-advisor.profileBySession";
 const SUMMARY_STORAGE_KEY = "gaokao-advisor.summaryBySession";
 const TURN_CONTEXT_STORAGE_KEY = "gaokao-advisor.turnContextBySession";
 const SUGGESTIONS_STORAGE_KEY = "gaokao-advisor.suggestionsBySession";
+const COMPOSER_DRAFT_EVENT = "gaokao:set-composer-draft";
+const COPILOT_CHAT_TEXTAREA_SELECTOR = '[data-testid="copilot-chat-textarea"]';
+const COPILOT_SEND_BUTTON_SELECTOR = '[data-testid="copilot-send-button"]';
 
 const CURRENT_AGENT_DATE = "2026-06-13";
 const GAOKAO_STAGE_CONTEXT =
@@ -281,6 +301,19 @@ function formatRank(rank: number | null | undefined) {
   return rank.toLocaleString("zh-CN");
 }
 
+function formatScore(score: number | null | undefined) {
+  if (typeof score !== "number" || Number.isNaN(score)) return "--";
+  return score.toLocaleString("zh-CN");
+}
+
+function profileCompletion(profile: StudentProfile | undefined) {
+  const filled = PROFILE_FIELDS.filter(({ key }) => {
+    const value = profile?.[key];
+    return value !== undefined && value !== "" && (!Array.isArray(value) || value.length > 0);
+  }).length;
+  return Math.round((filled / PROFILE_FIELDS.length) * 100);
+}
+
 function compactProfileValue(value: unknown) {
   if (Array.isArray(value)) return value.filter(Boolean).join("、");
   if (typeof value === "boolean") return value ? "可出省" : "不出省";
@@ -300,7 +333,7 @@ function profileLabelValue(profile: StudentProfile | undefined, key: keyof Stude
     score: "分数",
     rank: "位次",
     budget: "预算",
-    cityPreference: "城市",
+    cityPreference: "意向城市",
     canLeaveProvince: "出省",
     graduatePlan: "读研",
     majorPreference: "偏好",
@@ -322,7 +355,7 @@ const PROFILE_FIELDS: Array<{
   { key: "score", label: "分数", question: "我的高考分数是：" },
   { key: "rank", label: "位次", question: "我的全省位次是：" },
   { key: "budget", label: "预算", question: "我家里每年学费和生活费大概能接受：" },
-  { key: "cityPreference", label: "城市", question: "我更想去的城市或区域是：" },
+  { key: "cityPreference", label: "意向城市", question: "我更想去的城市或区域是：" },
   { key: "canLeaveProvince", label: "出省", question: "我能否接受出省读大学：" },
   { key: "graduatePlan", label: "读研", question: "我本科后更倾向就业、考研还是保研：" },
   { key: "majorPreference", label: "专业偏好", question: "我感兴趣的专业方向是：" },
@@ -355,6 +388,64 @@ const SUGGESTION_TEMPLATE_BY_FIELD: Partial<Record<keyof StudentProfile, string[
   majorPreference: ["我偏好的专业方向是："],
   avoidMajors: ["我想避开的专业是："],
 };
+
+const FALLBACK_SUGGESTIONS = ["我想冲 211", "帮我做稳妥方案", "不想出省", "想读计算机", "需要保研机会"];
+
+function getProfileValue(profile: StudentProfile, key: keyof StudentProfile, fallback = "待补") {
+  const value = compactProfileValue(profile[key]);
+  return value || fallback;
+}
+
+function buildStrategySummary(profile: StudentProfile, missingFields: Array<keyof StudentProfile>) {
+  const score = typeof profile.score === "number" ? profile.score : null;
+  const hasRank = typeof profile.rank === "number" && profile.rank > 0;
+  const risk = !hasRank || missingFields.includes("rank") ? "位次待补全" : "可进入精算";
+  const intro = score
+    ? `当前分数 ${score} 分具备较高院校匹配空间，`
+    : "当前画像仍在收集中，";
+  const blocker = missingFields.length
+    ? `但缺少${missingFields.slice(0, 3).map((key) => PROFILE_FIELDS.find((field) => field.key === key)?.label ?? key).join("、")}等关键项，暂不能生成最终冲稳保方案。`
+    : "关键画像已补齐，可以继续生成更精确的冲稳保方案。";
+
+  return {
+    risk,
+    body: `${intro}${blocker}建议先补齐位次、专业偏好和城市/预算约束，以获得更稳定的推荐结果。`,
+  };
+}
+
+function buildReportMarkdown({
+  profile,
+  missingFields,
+  summary,
+}: {
+  profile: StudentProfile;
+  missingFields: Array<keyof StudentProfile>;
+  summary: string;
+}) {
+  const profileRows = PROFILE_FIELDS.filter((field) => field.key !== "updatedAt")
+    .map((field) => `- ${field.label}: ${getProfileValue(profile, field.key, "未填写")}`)
+    .join("\n");
+
+  return [
+    "# 高考志愿填报 Agent 报告",
+    "",
+    `生成时间: ${new Date().toLocaleString("zh-CN")}`,
+    "",
+    "## 考生画像",
+    profileRows,
+    "",
+    "## 待补信息",
+    missingFields.length
+      ? missingFields.map((key) => `- ${PROFILE_FIELDS.find((field) => field.key === key)?.label ?? key}`).join("\n")
+      : "- 关键项已补齐",
+    "",
+    "## 当前策略摘要",
+    summary,
+    "",
+    "## 对话图表",
+    "- 录取趋势图表在聊天中按需生成，不固定写入主页报告。",
+  ].join("\n");
+}
 
 const DEFAULT_COMPREHENSIVE_PROVINCES = new Set(["北京", "天津", "上海", "浙江", "山东", "海南"]);
 
@@ -744,6 +835,12 @@ function extractProfileFromPrompt(prompt: string): Partial<StudentProfile> {
   }
   if (/不出省|不想出省|留本省|留省内/.test(text)) patch.canLeaveProvince = false;
   if (/可出省|能出省|接受出省|外省/.test(text)) patch.canLeaveProvince = true;
+  if (/出省(?:无所谓|都行|不限|不限制)|(?:无所谓|都行|不限|不限制)出省|哪里都行|去哪都行/.test(text)) {
+    patch.canLeaveProvince = true;
+  }
+  if (/城市(?:无所谓|都行|不限|不限制)|地区(?:无所谓|都行|不限|不限制)|(?:无所谓|都行|不限|不限制)(?:城市|地区)|哪里都行|去哪都行/.test(text)) {
+    patch.cityPreference = "不限地区";
+  }
 
   const citySignals = uniqueTextItems(
     [
@@ -836,6 +933,7 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
   const subjectTrack = args.subjectTrack || "科类";
   const sources = Array.isArray(args.sources) ? args.sources : [];
   const warnings = Array.isArray(args.warnings) ? args.warnings : [];
+  const isDemoSource = sources.some((source) => source.kind === "demo" || source.id === "demo");
   const hasOfficialSource = sources.some(isOfficialAdmissionSource);
   const inferredScope = args.dataScope ?? (hasOfficialSource ? "mixed" : "thirdPartyAggregate");
   const scopeLabel =
@@ -846,21 +944,24 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
         : inferredScope === "thirdPartyAggregate"
           ? "第三方聚合"
           : "混合口径";
-  const sourceLabel = hasOfficialSource ? scopeLabel : "第三方聚合";
+  const sourceLabel = hasOfficialSource ? scopeLabel : "辅助参考";
 
   const width = 360;
-  const trendHeight = 190;
+  const trendHeight = 210;
   const visibleBars = [...points].sort((a, b) => b.score - a.score).slice(0, 14);
   const barHeight = Math.max(230, Math.min(470, visibleBars.length * 30 + 76));
   const height = mode === "groupComparison" ? barHeight : trendHeight;
   const padding =
     mode === "groupComparison"
       ? { top: 24, right: 48, bottom: 42, left: 126 }
-      : { top: 24, right: 18, bottom: 34, left: 42 };
+      : { top: 30, right: 24, bottom: 44, left: 42 };
   const scoreValues = points.map((point) => point.score);
   const minScore = scoreValues.length ? Math.min(...scoreValues) : 0;
   const maxScore = scoreValues.length ? Math.max(...scoreValues) : 0;
   const scoreRange = Math.max(maxScore - minScore, 1);
+  const latestPoint = points.at(-1);
+  const previousPoint = points.at(-2);
+  const delta = latestPoint && previousPoint ? latestPoint.score - previousPoint.score : null;
 
   const trendPoints = points.map((point, index) => {
     const plotWidth = width - padding.left - padding.right;
@@ -875,36 +976,69 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
   const linePath = trendPoints
     .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
     .join(" ");
+  const analysisText =
+    args.analysisSummary ||
+    `${schoolName} 的分数线已经进入可视化分析，建议结合位次、专业组和选科要求继续判断。`;
+  const analysisLines = analysisText
+    .replace(/([。；;])\s*/g, "$1\n")
+    .replace(/，\s*(但|不过|建议|如果|你的|正式填报)/g, "，\n$1")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 5);
 
   return (
-    <div className="gaokao-score-chart my-3 w-full max-w-full overflow-hidden rounded-lg border border-zinc-200 bg-white text-zinc-950 shadow-sm">
-      <div className="border-b border-zinc-100 px-3 py-3">
+    <div className="gaokao-score-chart my-3 w-full max-w-full overflow-hidden rounded-[20px] border border-blue-100 bg-white text-slate-950 shadow-[0_18px_45px_rgba(15,23,42,0.08)]">
+      <div className="px-4 pb-2 pt-4">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-2 text-xs font-semibold text-red-700">
-              <Icon name="chart" className="h-3.5 w-3.5" />
-              <span>{mode === "groupComparison" ? "专业组分数对比" : "分数线趋势"}</span>
-            </div>
-            <h3 className="mt-1 break-words text-base font-semibold leading-6">
-              {schoolName} · {province}{subjectTrack}
+            <h3 className="break-words text-[18px] font-black leading-7">
+              {schoolName}{mode === "groupComparison" ? "分数对比" : "录取趋势分析"}
             </h3>
+            <p className="mt-0.5 text-xs font-medium text-slate-500">
+              {province} · {subjectTrack} · {points[0]?.year ?? "近年"}-{points.at(-1)?.year ?? "趋势"}
+            </p>
           </div>
-          <span className="shrink-0 rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-600">
+          <span className="shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-2.5 py-1 text-xs font-semibold text-blue-700">
             {sourceLabel}
           </span>
         </div>
       </div>
 
-      <div className="px-3 py-3">
-        {!hasOfficialSource ? (
-          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
-            以下曲线使用第三方聚合/搜索数据生成，可能存在更新滞后、专业组口径不同或页面转述误差。正式填报前请以省考试院和院校招生网核验。
+      <div className="px-4 pb-4 pt-2">
+        {!hasOfficialSource && !isDemoSource ? (
+          <div className="mb-3 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+            非官方来源会有口径差异，正式填报前请以省考试院和院校招生网核验。
           </div>
         ) : null}
 
-        {inferredScope === "mixed" ? (
-          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
-            当前图表为混合口径：可能同时包含考试院专业组投档线、学校专业录取分或第三方聚合数据，不可直接横向硬比。
+        {inferredScope === "mixed" && !isDemoSource ? (
+          <div className="mb-3 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+            当前为混合口径，可能包含投档线、专业分或聚合数据，不建议直接横向硬比。
+          </div>
+        ) : null}
+
+        {points.length > 0 ? (
+          <div className="mb-4 grid grid-cols-3 gap-2">
+            <div className="rounded-xl bg-blue-50 px-2 py-3 text-center">
+              <p className="text-lg font-black text-blue-700">
+                {minScore} - {maxScore}
+              </p>
+              <p className="mt-0.5 text-[11px] text-slate-500">近年分数区间</p>
+            </div>
+            <div className="rounded-xl bg-orange-50 px-2 py-3 text-center">
+              <p className="text-lg font-black text-orange-600">
+                {delta === null ? "--" : `${delta >= 0 ? "+" : ""}${delta}`}
+                <span className="text-xs"> 分</span>
+              </p>
+              <p className="mt-0.5 text-[11px] text-slate-500">最近年度变化</p>
+            </div>
+            <div className="rounded-xl bg-red-50 px-2 py-3 text-center">
+              <p className="text-lg font-black text-red-600">
+                {delta !== null && delta >= 35 ? "中高" : delta !== null && delta >= 15 ? "中" : "可控"}
+              </p>
+              <p className="mt-0.5 text-[11px] text-slate-500">风险等级</p>
+            </div>
           </div>
         ) : null}
 
@@ -938,14 +1072,14 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
                         y={barTop}
                         width={barWidth}
                         height="18"
-                        rx="4"
-                        fill={index === 0 ? "#991b1b" : "#dc2626"}
-                        opacity={index === 0 ? 0.95 : 0.75}
+                        rx="9"
+                        fill={index === 0 ? "#2563eb" : "#60a5fa"}
+                        opacity={index === 0 ? 0.95 : 0.78}
                       />
                       <text
                         x={Math.min(width - 30, padding.left + barWidth + 6)}
                         y={barTop + 13}
-                        className="fill-zinc-900 text-[10px] font-semibold"
+                        className="fill-slate-900 text-[10px] font-semibold"
                       >
                         {point.score}
                       </text>
@@ -958,35 +1092,50 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
               </>
             ) : (
               <>
+                {[0, 0.5, 1].map((ratio) => {
+                  const y = padding.top + ratio * (trendHeight - padding.top - padding.bottom);
+                  return (
+                    <line
+                      key={ratio}
+                      x1={padding.left}
+                      y1={y}
+                      x2={width - padding.right}
+                      y2={y}
+                      stroke="#e2e8f0"
+                      strokeDasharray={ratio === 1 ? undefined : "4 5"}
+                    />
+                  );
+                })}
                 <line
                   x1={padding.left}
                   y1={padding.top}
                   x2={padding.left}
                   y2={trendHeight - padding.bottom}
-                  stroke="#e4e4e7"
+                  stroke="#cbd5e1"
                 />
                 <line
                   x1={padding.left}
                   y1={trendHeight - padding.bottom}
                   x2={width - padding.right}
                   y2={trendHeight - padding.bottom}
-                  stroke="#e4e4e7"
+                  stroke="#cbd5e1"
                 />
-                <text x="4" y={padding.top + 4} className="fill-zinc-500 text-[10px]">
+                <text x="4" y={padding.top + 4} className="fill-slate-500 text-[10px]">
                   {maxScore}
                 </text>
-                <text x="4" y={trendHeight - padding.bottom} className="fill-zinc-500 text-[10px]">
+                <text x="4" y={trendHeight - padding.bottom} className="fill-slate-500 text-[10px]">
                   {minScore}
                 </text>
-                <path d={linePath} fill="none" stroke="#b91c1c" strokeWidth="3" />
+                <path d={linePath} fill="none" stroke="#2563eb" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
                 {trendPoints.map((point) => (
                   <g key={`${point.year}-${point.groupName}-${point.score}`}>
-                    <circle cx={point.x} cy={point.y} r="4.5" fill="#b91c1c" />
+                    <circle cx={point.x} cy={point.y} r="6" fill="#bfdbfe" />
+                    <circle cx={point.x} cy={point.y} r="3.8" fill="#2563eb" />
                     <text
                       x={point.x}
                       y={Math.max(12, point.y - 9)}
                       textAnchor="middle"
-                      className="fill-zinc-900 text-[10px] font-semibold"
+                      className={point === latestPoint ? "fill-red-600 text-[10px] font-bold" : "fill-slate-700 text-[10px] font-semibold"}
                     >
                       {point.score}
                     </text>
@@ -994,7 +1143,7 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
                       x={point.x}
                       y={trendHeight - 12}
                       textAnchor="middle"
-                      className="fill-zinc-500 text-[10px]"
+                      className="fill-slate-500 text-[10px]"
                     >
                       {point.year}
                     </text>
@@ -1004,42 +1153,31 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
             )}
           </svg>
         ) : (
-          <div className="rounded-md border border-dashed border-zinc-300 bg-zinc-50 p-3 text-sm leading-6 text-zinc-600">
+          <div className="rounded-xl border border-dashed border-blue-200 bg-blue-50/60 p-3 text-sm leading-6 text-slate-600">
             暂无可绘制的分数线数据。需要至少查到年份、分数和来源；第三方数据会被明确标注，不能用猜测数据画图。
           </div>
         )}
 
-        {points.length > 0 ? (
-          <div className="mt-3 space-y-2 text-xs text-zinc-700" aria-label="录取分数线明细">
-            {points.slice(0, 8).map((point) => (
-              <div
-                key={`score-card-${point.year}-${point.groupName}-${point.score}`}
-                className="rounded-md border border-zinc-100 bg-zinc-50 px-3 py-2"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-semibold text-zinc-950">{point.year}</span>
-                  <span className="rounded border border-red-100 bg-white px-2 py-0.5 font-semibold text-red-700">
-                    {point.score} 分
-                  </span>
-                </div>
-                <p className="mt-1 break-words leading-5 text-zinc-700">{point.groupName}</p>
-                <p className="mt-1 leading-5 text-zinc-500">最低位次：{formatRank(point.rank)}</p>
-                {point.majorName ? (
-                  <p className="mt-1 break-words leading-5 text-zinc-500">
-                    最低专业：{point.majorName}
+        <div className="mt-4 rounded-2xl border border-blue-100 bg-blue-50/80 px-4 py-3">
+          <div className="flex items-start gap-3">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-white">
+              <CpuChipIcon className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-sm font-black text-blue-950">趋势子 agent 解读</p>
+              <div className="mt-1 space-y-1.5 text-sm leading-6 text-slate-700">
+                {analysisLines.map((line, index) => (
+                  <p key={`${line}-${index}`} className="break-words">
+                    {line}
                   </p>
-                ) : null}
+                ))}
               </div>
-            ))}
+            </div>
           </div>
-        ) : null}
-
-        {args.analysisSummary ? (
-          <p className="mt-3 text-sm leading-6 text-zinc-800">{args.analysisSummary}</p>
-        ) : null}
+        </div>
 
         {warnings.length > 0 ? (
-          <div className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+          <div className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
             {warnings.slice(0, 2).map((warning) => (
               <p key={warning}>{warning}</p>
             ))}
@@ -1047,8 +1185,8 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
         ) : null}
 
         {sources.length > 0 ? (
-          <div className="mt-3 border-t border-zinc-100 pt-2">
-            <p className="text-xs font-semibold text-zinc-500">来源</p>
+          <div className="mt-3 border-t border-blue-50 pt-2">
+            <p className="text-xs font-semibold text-slate-500">来源</p>
             <div className="mt-1 grid gap-1">
               {sources.slice(0, 4).map((source, index) =>
                 source.url?.trim() ? (
@@ -1057,14 +1195,14 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
                     href={source.url}
                     target="_blank"
                     rel="noreferrer"
-                    className="break-words text-xs text-red-700 underline underline-offset-2"
+                    className="break-words text-xs text-blue-700 underline underline-offset-2"
                   >
                     {source.title}
                   </a>
                 ) : (
                   <span
                     key={`${source.title}-${index}`}
-                    className="break-words text-xs text-zinc-600"
+                    className="break-words text-xs text-slate-600"
                   >
                     {source.title}
                   </span>
@@ -1204,7 +1342,18 @@ function VolunteerPlanCards({ profile, tiers, warnings = [], sources = [] }: Vol
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <h4 className="break-words text-sm font-semibold">{item.schoolName}</h4>
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                        <h4 className="break-words text-sm font-semibold">{item.schoolName}</h4>
+                        {item.schoolName ? (
+                          <button
+                            type="button"
+                            onClick={() => submitSchoolTrendPrompt(item.schoolName, profile)}
+                            className="gaokao-school-score-button shrink-0 rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[11px] font-black text-blue-700"
+                          >
+                            查看分数线
+                          </button>
+                        ) : null}
+                      </div>
                       <p className="mt-1 break-words text-xs leading-5 text-zinc-600">
                         {item.groupName || "专业组待核验"} · {item.majorDirection}
                       </p>
@@ -1295,7 +1444,20 @@ function SchoolComparisonCard({ schools, sources = [], warnings = [] }: SchoolCo
           safeSchools.map((school) => (
           <article key={school.schoolName} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
             <div className="flex items-start justify-between gap-2">
-              <h4 className="break-words text-sm font-semibold">{school.schoolName}</h4>
+              <div className="min-w-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <h4 className="break-words text-sm font-semibold">{school.schoolName}</h4>
+                  {school.schoolName ? (
+                    <button
+                      type="button"
+                      onClick={() => submitSchoolTrendPrompt(school.schoolName)}
+                      className="gaokao-school-score-button shrink-0 rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[11px] font-black text-blue-700"
+                    >
+                      查看分数线
+                    </button>
+                  ) : null}
+                </div>
+              </div>
               <span className="shrink-0 rounded border border-zinc-200 bg-white px-2 py-0.5 text-xs text-zinc-700">
                 {school.scoreRisk}
               </span>
@@ -1389,9 +1551,21 @@ function ToolReasoning({
   const isRunning = status === "executing" || status === "inProgress";
   const entries =
     args && typeof args === "object" && !Array.isArray(args) ? Object.entries(args) : [];
+  const toolArgObject = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
+  const queriedSchool =
+    typeof toolArgObject.schoolName === "string"
+      ? toolArgObject.schoolName
+      : typeof toolArgObject.target === "object" &&
+          toolArgObject.target &&
+          "schoolName" in toolArgObject.target &&
+          typeof (toolArgObject.target as { schoolName?: unknown }).schoolName === "string"
+        ? (toolArgObject.target as { schoolName: string }).schoolName
+        : "";
   const label =
     name === "lookupAdmissionScores"
-      ? "官方分数线查询"
+      ? queriedSchool
+        ? `${isRunning ? "查询" : "已查询"}${queriedSchool}`
+        : "官方分数线查询"
       : name === "lookupRankByScore"
         ? "位次查询"
         : name === "researchGaokaoData"
@@ -1409,13 +1583,26 @@ function ToolReasoning({
       : name === "lookupAdmissionScores" || name === "lookupRankByScore"
         ? "思考过程"
         : "工具过程";
+  const formatToolValue = (value: unknown) => {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  };
 
   return (
     <details
       open={isRunning}
       className="my-2 px-3 text-xs text-zinc-600"
+      data-gaokao-process-kind={name === "lookupAdmissionScores" ? "admission-score" : undefined}
+      data-gaokao-school={queriedSchool || undefined}
+      data-gaokao-running={isRunning ? "true" : "false"}
     >
-      <summary className="flex cursor-pointer list-none items-center gap-2 py-1.5 font-medium text-zinc-600">
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-xl bg-white/70 px-3 py-2 font-medium text-zinc-600 ring-1 ring-zinc-200/80">
         <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-50 text-zinc-500 ring-1 ring-zinc-200">
           <Icon
             name={name === "lookupAdmissionScores" || name === "researchGaokaoData" ? "search" : "clock"}
@@ -1436,17 +1623,13 @@ function ToolReasoning({
         </span>
       </summary>
       {entries.length > 0 ? (
-        <div className="ml-7 grid gap-1 border-l border-zinc-200 px-3 py-1.5">
+        <div className="ml-7 grid max-h-48 gap-2 overflow-y-auto border-l border-zinc-200 px-3 py-1.5">
           {entries.slice(0, 5).map(([key, value]) => (
-            <div key={key} className="grid grid-cols-[72px_1fr] gap-2">
-              <span className="text-zinc-500">{key}</span>
-              <span className="truncate text-zinc-700">
-                {typeof value === "string" || typeof value === "number"
-                  ? String(value)
-                  : Array.isArray(value)
-                    ? `[${value.join(", ")}]`
-                    : JSON.stringify(value)}
-              </span>
+            <div key={key} className="min-w-0 rounded-lg bg-white/55 px-2 py-1.5 ring-1 ring-zinc-200/70">
+              <span className="block text-[11px] font-black text-zinc-500">{key}</span>
+              <pre className="mt-1 max-w-full whitespace-pre-wrap break-words font-sans text-[11px] leading-4 text-zinc-700">
+                {formatToolValue(value)}
+              </pre>
             </div>
           ))}
         </div>
@@ -1754,11 +1937,16 @@ function useSessionInsights(activeSessionId: string) {
     setSuggestionsBySession((current) => ({ ...current, [sessionId]: turnContext.suggestions }));
   }, []);
 
+  const upsertSuggestions = useCallback((sessionId: string, suggestions: string[]) => {
+    setSuggestionsBySession((current) => ({ ...current, [sessionId]: uniqueTextItems(suggestions).slice(0, 8) }));
+  }, []);
+
   return {
     activeSessionSummary: summaryBySession[activeSessionId] ?? "",
     activeTurnContext: turnContextBySession[activeSessionId],
     activeSuggestions: suggestionsBySession[activeSessionId] ?? [],
     upsertTurnContext,
+    upsertSuggestions,
   };
 }
 
@@ -1837,25 +2025,106 @@ function useMobileVisualViewport() {
   }, []);
 }
 
+function useAssistantSuggestionRefresh({
+  activeSessionId,
+  profile,
+  missingPriority,
+  upsertSuggestions,
+}: {
+  activeSessionId: string;
+  profile: StudentProfile;
+  missingPriority?: Array<keyof StudentProfile>;
+  upsertSuggestions: (sessionId: string, suggestions: string[]) => void;
+}) {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let timer = 0;
+    let lastText = "";
+
+    const refreshSuggestions = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        const latestAssistantText = readLastAssistantText();
+        if (!latestAssistantText || latestAssistantText === lastText) return;
+        lastText = latestAssistantText;
+        const nextMissing = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
+        const nextSuggestions = buildSuggestions(profile, nextMissing, latestAssistantText);
+        if (nextSuggestions.length) upsertSuggestions(activeSessionId, nextSuggestions);
+      }, 350);
+    };
+
+    refreshSuggestions();
+    const observer = new MutationObserver(refreshSuggestions);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    return () => {
+      window.clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [activeSessionId, missingPriority, profile, upsertSuggestions]);
+}
+
+function syncHiddenCopilotPrompt(message: string, focusHidden = false) {
+  const textarea = document.querySelector<HTMLTextAreaElement>(COPILOT_CHAT_TEXTAREA_SELECTOR);
+  if (textarea) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(textarea, message);
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    if (focusHidden) textarea.focus();
+  }
+}
+
 function insertPrompt(message: string) {
-  const textarea = document.querySelector<HTMLTextAreaElement>("textarea");
-  if (!textarea) return;
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(textarea, message);
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
-  textarea.focus();
+  window.dispatchEvent(new CustomEvent(COMPOSER_DRAFT_EVENT, { detail: message }));
+}
+
+function buildSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
+  const province = profile?.province ? `${profile.province}` : "";
+  const subjectTrack = profile?.subjectTrack ? `${profile.subjectTrack}` : "";
+  const scope = [province, subjectTrack].filter(Boolean).join("");
+  return `查看${schoolName}近三年${scope ? `在${scope}` : ""}录取分数线趋势，并绘制曲线。`;
+}
+
+function submitSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
+  const prompt = buildSchoolTrendPrompt(schoolName, profile);
+  insertPrompt(prompt);
+  window.setTimeout(() => submitHiddenCopilotPrompt(prompt), 80);
+}
+
+function submitHiddenCopilotPrompt(message: string) {
+  syncHiddenCopilotPrompt(message, false);
+  let attempts = 0;
+  const trySend = () => {
+    const { sendButton, textarea } = getCopilotChatInputElements();
+    if (!sendButton || !textarea || !textarea.value.trim()) {
+      if (attempts++ < 10) window.setTimeout(trySend, 50);
+      return;
+    }
+    if (sendButton.disabled) {
+      if (attempts++ < 10) window.setTimeout(trySend, 50);
+      return;
+    }
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    sendButton.click();
+  };
+  window.setTimeout(trySend, 50);
 }
 
 function getCopilotChatInputElements() {
   return {
-    sendButton: document.querySelector<HTMLButtonElement>('[data-testid="copilot-send-button"]'),
-    textarea: document.querySelector<HTMLTextAreaElement>('[data-testid="copilot-chat-textarea"]'),
+    sendButton: document.querySelector<HTMLButtonElement>(COPILOT_SEND_BUTTON_SELECTOR),
+    textarea: document.querySelector<HTMLTextAreaElement>(COPILOT_CHAT_TEXTAREA_SELECTOR),
   };
 }
 
 function useAutoSessionTitle(
   activeSessionId: string,
   onPromptSubmitted: (sessionId: string, prompt: string) => void,
+  manuallySubmittedPromptRef?: MutableRefObject<{ prompt: string; submittedAt: number } | null>,
 ) {
   const lastPromptRef = useRef("");
   const lastCapturedAtRef = useRef(0);
@@ -1874,6 +2143,12 @@ function useAutoSessionTitle(
 
       const now = Date.now();
       if (prompt === lastPromptRef.current && now - lastCapturedAtRef.current < 1000) return;
+      const manual = manuallySubmittedPromptRef?.current;
+      if (manual?.prompt === prompt && now - manual.submittedAt < 1500) {
+        lastPromptRef.current = prompt;
+        lastCapturedAtRef.current = now;
+        return;
+      }
       lastPromptRef.current = prompt;
       lastCapturedAtRef.current = now;
       flushSync(() => {
@@ -1919,7 +2194,7 @@ function useAutoSessionTitle(
       observer.disconnect();
       detachHandlers.forEach((detach) => detach());
     };
-  }, [activeSessionId, onPromptSubmitted]);
+  }, [activeSessionId, manuallySubmittedPromptRef, onPromptSubmitted]);
 }
 
 function useMobileSendBridge(activeSessionId: string) {
@@ -2009,85 +2284,276 @@ function useMobileSendBridge(activeSessionId: string) {
   return { triggerMobileSend };
 }
 
-function ProfileStrip({
-  profile,
-  missingPriority = [],
-}: {
-  profile: StudentProfile;
-  missingPriority?: Array<keyof StudentProfile>;
-}) {
-  const knownFields = PROFILE_FIELDS.map(({ key }) => ({
-    key,
-    value: profileLabelValue(profile, key),
-  })).filter((item) => item.value && item.key !== "updatedAt");
-  const missingFields = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
-  const missingByKey = new Map(PROFILE_FIELDS.map((field) => [field.key, field]));
-
+function PanelAgentBadge({ label }: { label: string }) {
   return (
-    <div className="mt-2 border-t border-zinc-100 bg-zinc-50/70 px-1 pt-2">
-      <div className="grid gap-2">
-        <section className="min-w-0">
-          <div className="mb-1 flex items-center gap-2 px-0.5">
-            <p className="shrink-0 text-[11px] font-semibold text-zinc-500">当前画像</p>
-            <div className="h-px flex-1 bg-zinc-200" />
-          </div>
-          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
-            {knownFields.length ? (
-              knownFields.map((item) => <ProfilePill key={String(item.key)}>{item.value}</ProfilePill>)
-            ) : (
-              <ProfilePill muted onClick={() => insertPrompt("我先补充一下我的高考省份、科类、分数、位次和家庭预算：")}>
-                暂无画像
-              </ProfilePill>
-            )}
-          </div>
-        </section>
-        <section className="min-w-0">
-          <div className="mb-1 flex items-center gap-2 px-0.5">
-            <p className="shrink-0 text-[11px] font-semibold text-zinc-500">待补画像</p>
-            <div className="h-px flex-1 border-t border-dashed border-zinc-300" />
-          </div>
-          <div className="flex min-w-0 gap-1.5 overflow-x-auto pb-1">
-            {missingFields.length ? (
-              missingFields.map((key, index) => {
-                const field = missingByKey.get(key);
-                if (!field) return null;
-                return (
-                  <ProfilePill
-                    key={`missing-strip-${field.key}`}
-                    muted
-                    highlight={index === 0}
-                    onClick={() => insertPrompt(field.question)}
-                  >
-                    {field.label}待补
-                  </ProfilePill>
-                );
-              })
-            ) : (
-              <ProfilePill muted>关键项已补齐</ProfilePill>
-            )}
-          </div>
-        </section>
-      </div>
-    </div>
+    <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-1 text-[11px] font-bold text-blue-700">
+      <CpuChipIcon className="h-3.5 w-3.5" />
+      {label}
+    </span>
   );
 }
 
-function SuggestionBar({ suggestions }: { suggestions: string[] }) {
-  if (!suggestions.length) return null;
+function AppHeader({
+  onCreate,
+  onExport,
+}: {
+  onCreate: () => void;
+  onExport: () => void;
+}) {
+  return (
+    <header className="px-4 pb-3 pt-4">
+      <div className="flex items-center gap-3">
+        <div className="flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-500/25">
+          <AcademicCapIcon className="h-8 w-8" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <h1 className="truncate text-[22px] font-black leading-7 tracking-normal text-slate-950">
+              高考志愿填报 Agent
+            </h1>
+            <span className="rounded-lg bg-blue-100 px-2 py-0.5 text-xs font-black text-blue-700">AI</span>
+          </div>
+          <p className="mt-0.5 truncate text-[13px] font-medium text-slate-500">
+            院校录取趋势 · 位次匹配 · 志愿方案生成
+          </p>
+        </div>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <button
+          type="button"
+          onClick={onCreate}
+          className="flex h-12 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white text-sm font-bold text-slate-900 shadow-sm"
+        >
+          <PencilSquareIcon className="h-5 w-5 text-blue-700" />
+          新建方案
+        </button>
+        <button
+          type="button"
+          onClick={onExport}
+          className="flex h-12 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white text-sm font-bold text-slate-900 shadow-sm"
+        >
+          <ArrowDownTrayIcon className="h-5 w-5 text-blue-700" />
+          导出报告
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function CandidateProfileCard({
+  profile,
+  completion,
+  missingCount,
+  strategySummary,
+  missingPriority = [],
+  onIgnoreMissing,
+}: {
+  profile: StudentProfile;
+  completion: number;
+  missingCount: number;
+  strategySummary: ReturnType<typeof buildStrategySummary>;
+  missingPriority?: Array<keyof StudentProfile>;
+  onIgnoreMissing: () => void;
+}) {
+  const chips = [
+    { icon: MapPinIcon, label: "省份", value: getProfileValue(profile, "province") },
+    { icon: BookOpenIcon, label: "科类", value: getProfileValue(profile, "subjectTrack") },
+    { icon: AcademicCapIcon, label: "升学倾向", value: getProfileValue(profile, "graduatePlan", "读研 / 保研") },
+    { icon: TrophyIcon, label: "目标层次", value: profile.score && profile.score >= 620 ? "211 / 双一流" : "待判断" },
+    { icon: BuildingLibraryIcon, label: "意向城市", value: getProfileValue(profile, "cityPreference") },
+    { icon: CheckBadgeIcon, label: "当前状态", value: missingCount ? "待补全关键信息" : "可生成方案", danger: missingCount > 0 },
+  ];
+  const missingFields = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
+  const missingByKey = new Map(PROFILE_FIELDS.map((field) => [field.key, field]));
+  const icons: Partial<Record<keyof StudentProfile, typeof BookOpenIcon>> = {
+    rank: TrophyIcon,
+    subjectTrack: BookOpenIcon,
+    budget: WalletIcon,
+    canLeaveProvince: RocketLaunchIcon,
+    majorPreference: StarIcon,
+    cityPreference: MapPinIcon,
+    graduatePlan: AcademicCapIcon,
+  };
+  const strategyCards = [
+    { title: "冲刺方案", subtitle: "冲高目标院校", icon: RocketLaunchIcon, tone: "bg-red-50 text-red-600" },
+    { title: "稳妥方案", subtitle: "匹配稳妥院校", icon: ShieldCheckIcon, tone: "bg-blue-50 text-blue-700" },
+    { title: "保底方案", subtitle: "确保录取院校", icon: StarIcon, tone: "bg-emerald-50 text-emerald-600" },
+  ];
+  const strategyBody =
+    strategySummary?.body ||
+    "当前画像仍在收集中，建议先补齐关键项；也可以忽略待补信息，直接生成一版初步意见摘要。";
 
   return (
-    <div className="gaokao-suggestion-bar" aria-label="建议回复">
-      <div className="flex gap-1.5 overflow-x-auto px-3 py-2">
-        {suggestions.slice(0, 8).map((suggestion, index) => (
+    <section className="mx-4 rounded-[22px] border border-blue-100 bg-white p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)]">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-[19px] font-black text-slate-950">考生画像</h2>
+          <ShieldCheckIcon className="h-5 w-5 text-blue-600" />
+        </div>
+        <PanelAgentBadge label="画像子 agent" />
+      </div>
+      <div className="mt-3 flex items-center gap-3">
+        <span className="text-sm font-semibold text-slate-500">信息完整度</span>
+        <span className="text-sm font-black text-blue-700">{completion}%</span>
+        <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
+          <div className="h-full rounded-full bg-blue-600" style={{ width: `${completion}%` }} />
+        </div>
+      </div>
+      <div className="mt-5 grid grid-cols-[1fr_auto] items-end gap-3">
+        <div>
+          <p className="text-[54px] font-black leading-none text-blue-600">{formatScore(profile.score)}</p>
+          <p className="mt-1 text-sm font-bold text-slate-950">
+            {profile.score ? "分" : "分数待补"}
+            <span className="ml-2 text-slate-400">/ 750</span>
+          </p>
+        </div>
+        <div className="flex flex-col items-end gap-2">
+          <span className="rounded-xl bg-blue-50 px-3 py-1.5 text-sm font-black text-blue-700">
+            {getProfileValue(profile, "province", "省份待补")}考生
+          </span>
+          {missingCount ? (
+            <span className="rounded-xl bg-red-50 px-3 py-1.5 text-sm font-black text-red-600">
+              位次待补全
+            </span>
+          ) : null}
+        </div>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-x-3 gap-y-3 rounded-2xl border border-blue-50 bg-white/80 p-3">
+        {chips.map((chip) => {
+          const IconComponent = chip.icon;
+          return (
+            <div key={chip.label} className="grid grid-cols-[20px_1fr] gap-2">
+              <IconComponent className="mt-0.5 h-4 w-4 text-slate-500" />
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-slate-500">{chip.label}</p>
+                <p className={`truncate text-sm font-black ${chip.danger ? "text-red-600" : "text-slate-950"}`}>
+                  {chip.value}
+                </p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-4 border-t border-blue-50 pt-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <p className="text-sm font-black text-slate-950">待补信息</p>
+          <span className="text-xs font-black text-blue-700">{missingFields.length} 项待补充</span>
+        </div>
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+          {missingFields.length ? (
+            missingFields.map((key, index) => {
+              const field = missingByKey.get(key);
+              if (!field) return null;
+              const IconComponent = icons[key] ?? AdjustmentsHorizontalIcon;
+              return (
+                <button
+                  key={field.key}
+                  type="button"
+                  onClick={() => insertPrompt(field.question)}
+                  className={`flex h-9 min-w-max shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3.5 text-left ${
+                    index === 0
+                      ? "border-red-200 bg-red-50 text-red-600"
+                      : "border-blue-100 bg-blue-50/70 text-slate-700"
+                  }`}
+                >
+                  <IconComponent className="h-4 w-4 shrink-0" />
+                  <span className="text-xs font-black leading-none">{field.label}</span>
+                </button>
+              );
+            })
+          ) : (
+            <span className="h-9 shrink-0 rounded-xl bg-emerald-50 px-3.5 py-2.5 text-xs font-bold leading-none text-emerald-700">
+              关键画像已补齐
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="mt-4 border-t border-blue-50 pt-4">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-[17px] font-black text-slate-950">当前策略摘要</h3>
+          <PanelAgentBadge label="策略子 agent" />
+        </div>
+        <p className="mt-3 text-sm leading-6 text-slate-600">{strategyBody}</p>
+        <div className="mt-4 grid grid-cols-3 gap-3">
+          {strategyCards.map((card) => {
+            const IconComponent = card.icon;
+            return (
+              <button
+                key={card.title}
+                type="button"
+                onClick={() => insertPrompt(`请生成我的${card.title}，并说明依据。`)}
+                className={`rounded-xl px-2 py-4 text-center ${card.tone}`}
+              >
+                <IconComponent className="mx-auto h-7 w-7" />
+                <p className="mt-2 text-sm font-black">{card.title}</p>
+                <p className="mt-0.5 text-xs font-semibold text-slate-600">{card.subtitle}</p>
+              </button>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={onIgnoreMissing}
+          className="mt-3 flex h-11 w-full items-center justify-center rounded-xl border border-slate-200 bg-slate-950 px-3 text-sm font-black text-white shadow-sm"
+        >
+          忽略待补信息，直接给意见摘要
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function StrategySummaryCard({
+  summary,
+}: {
+  summary: ReturnType<typeof buildStrategySummary>;
+}) {
+  const cards = [
+    { title: "冲刺方案", subtitle: "冲高目标院校", icon: RocketLaunchIcon, tone: "bg-red-50 text-red-600" },
+    { title: "稳妥方案", subtitle: "匹配稳妥院校", icon: ShieldCheckIcon, tone: "bg-blue-50 text-blue-700" },
+    { title: "保底方案", subtitle: "确保录取院校", icon: StarIcon, tone: "bg-emerald-50 text-emerald-600" },
+  ];
+
+  return (
+    <section className="mx-4 rounded-[22px] border border-slate-200 bg-white p-4 shadow-[0_14px_36px_rgba(15,23,42,0.06)]">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-[19px] font-black text-slate-950">当前策略摘要</h2>
+        <PanelAgentBadge label="策略子 agent" />
+      </div>
+      <p className="mt-3 text-sm leading-6 text-slate-600">{summary.body}</p>
+      <div className="mt-4 grid grid-cols-3 gap-3">
+        {cards.map((card) => {
+          const IconComponent = card.icon;
+          return (
+            <button
+              key={card.title}
+              type="button"
+              onClick={() => insertPrompt(`请生成我的${card.title}，并说明依据。`)}
+              className={`rounded-xl px-2 py-4 text-center ${card.tone}`}
+            >
+              <IconComponent className="mx-auto h-7 w-7" />
+              <p className="mt-2 text-sm font-black">{card.title}</p>
+              <p className="mt-0.5 text-xs font-semibold text-slate-600">{card.subtitle}</p>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function PromptSuggestions({ suggestions }: { suggestions: string[] }) {
+  const items = suggestions.length ? suggestions : FALLBACK_SUGGESTIONS;
+
+  return (
+    <div className="gaokao-floating-suggestions" aria-label="你可能想问">
+      <div className="flex gap-2 overflow-x-auto px-3 py-2">
+        {items.slice(0, 7).map((suggestion) => (
           <button
-            key={`${suggestion}-${index}`}
+            key={suggestion}
             type="button"
             onClick={() => insertPrompt(suggestion)}
-            className={`shrink-0 rounded-md border px-2.5 py-1.5 text-xs shadow-sm ${
-              index === 0
-                ? "border-red-200 bg-red-50 font-semibold text-red-800"
-                : "border-zinc-200 bg-white text-zinc-700"
-            }`}
+            className="shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-bold text-slate-700"
           >
             {suggestion}
           </button>
@@ -2097,26 +2563,289 @@ function SuggestionBar({ suggestions }: { suggestions: string[] }) {
   );
 }
 
+function AgentConversationPanel({
+  activeSessionId,
+  activeSuggestions,
+  toolsMenu,
+}: {
+  activeSessionId: string;
+  activeSuggestions: string[];
+  toolsMenu: (ToolsMenuItem | "-")[];
+}) {
+  return (
+    <section className="gaokao-chat-layer mx-4">
+      <div className="gaokao-visible-chat-wrap">
+        <CopilotChat
+          agentId="default"
+          className="gaokao-chat gaokao-visible-chat h-full"
+          threadId={activeSessionId}
+          key={activeSessionId}
+          labels={{
+            chatInputPlaceholder: activeSuggestions[0] || "直接问：海南高考 680 分能去什么学校？",
+            chatDisclaimerText: "重要志愿决策请以省考试院和院校官方数据为准。",
+            welcomeMessageText:
+              "我是志愿填报 agent，会先聊清楚省份、科类、分数、位次和家庭约束。问分数线时我会先查官方数据，再用图表说话。",
+            modalHeaderTitle: "高考志愿填报 Agent",
+          }}
+          input={{
+            showDisclaimer: true,
+            autoFocus: false,
+            toolsMenu,
+          }}
+          welcomeScreen={{
+            className: "px-4",
+          }}
+        />
+      </div>
+    </section>
+  );
+}
+
+function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) {
+  const [draft, setDraft] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const dockRef = useRef<HTMLDivElement | null>(null);
+
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "44px";
+    textarea.style.height = `${Math.min(112, Math.max(44, textarea.scrollHeight))}px`;
+    window.requestAnimationFrame(() => {
+      const height = dockRef.current?.getBoundingClientRect().height ?? 88;
+      document.documentElement.style.setProperty("--gaokao-composer-height", `${Math.ceil(height)}px`);
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleDraft = (event: Event) => {
+      const customEvent = event as CustomEvent<string>;
+      setDraft(customEvent.detail ?? "");
+    };
+    window.addEventListener(COMPOSER_DRAFT_EVENT, handleDraft);
+    return () => window.removeEventListener(COMPOSER_DRAFT_EVENT, handleDraft);
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [draft, resizeTextarea]);
+
+  const submitDraft = useCallback(() => {
+    const prompt = draft.trim();
+    if (!prompt) return;
+    onSubmit(prompt);
+    setDraft("");
+  }, [draft, onSubmit]);
+
+  return (
+    <div ref={dockRef} className="gaokao-text-composer">
+      <div className="flex items-center gap-3 rounded-[22px] bg-white p-3 shadow-[0_20px_45px_rgba(15,23,42,0.12)] ring-1 ring-slate-200">
+        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-blue-50 text-blue-700">
+          <CpuChipIcon className="h-6 w-6" />
+        </div>
+        <textarea
+          ref={textareaRef}
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            syncHiddenCopilotPrompt(event.target.value);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              submitDraft();
+            }
+          }}
+          rows={1}
+          className="max-h-28 min-h-11 flex-1 resize-none overflow-y-auto rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base leading-5 text-slate-900 outline-none placeholder:text-slate-400 focus:border-blue-300 focus:ring-2 focus:ring-blue-100"
+          placeholder="输入你的位次、目标专业、预算或出省意愿..."
+        />
+        <button
+          type="button"
+          onClick={submitDraft}
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-500/25 disabled:bg-slate-300 disabled:shadow-none"
+          disabled={!draft.trim()}
+          aria-label="发送"
+        >
+          <PaperAirplaneIcon className="h-5 w-5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function usePanelAgentContexts({
+  activeSessionId,
+  profile,
+  missingFields,
+  summary,
+  suggestions,
+}: {
+  activeSessionId: string;
+  profile: StudentProfile;
+  missingFields: Array<keyof StudentProfile>;
+  summary: ReturnType<typeof buildStrategySummary>;
+  suggestions: string[];
+}) {
+  useAgentContext({
+    description: "画像子 agent 上下文",
+    value:
+      `panelAgent=candidateProfile; threadId=${activeSessionId}; ` +
+      `职责=只维护考生画像字段和信息完整度，不生成院校清单。` +
+      `profile=${JSON.stringify(profile)}; missing=${missingFields.join(",") || "none"}。`,
+  });
+  useAgentContext({
+    description: "待补信息子 agent 上下文",
+    value:
+      `panelAgent=missingInfo; threadId=${activeSessionId}; ` +
+      `职责=只判断下一步最该补的字段并生成短追问。` +
+      `missing=${missingFields.join(",") || "none"}。`,
+  });
+  useAgentContext({
+    description: "策略摘要子 agent 上下文",
+    value:
+      `panelAgent=strategySummary; threadId=${activeSessionId}; ` +
+      `职责=只输出冲稳保策略摘要，不查询分数线。risk=${summary.risk}; body=${summary.body}`,
+  });
+  useAgentContext({
+    description: "趋势图子 agent 上下文",
+    value:
+      `panelAgent=admissionTrend; threadId=${activeSessionId}; ` +
+      "职责=只处理聊天中 scoreLineTrendChart 生成的图表数据、来源和 SVG 曲线解释；没有图表时不要生成默认趋势卡。",
+  });
+  useAgentContext({
+    description: "建议问题子 agent 上下文",
+    value:
+      `panelAgent=promptSuggestions; threadId=${activeSessionId}; ` +
+      `职责=只提供 5 条以内下一问建议。suggestions=${suggestions.join("；") || "none"}。`,
+  });
+}
+
+function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    let frame = 0;
+    let suppressObserver = false;
+
+    const compact = () => {
+      suppressObserver = true;
+      const assistantMessages = Array.from(document.querySelectorAll<HTMLElement>(".copilotKitAssistantMessage"));
+
+      assistantMessages.forEach((message) => {
+        const wasGroupOpen = Boolean(message.querySelector<HTMLDetailsElement>(".gaokao-tool-process-group")?.open);
+        message.querySelectorAll(".gaokao-tool-process-group").forEach((node) => node.remove());
+        const toolDetails = Array.from(
+          message.querySelectorAll<HTMLDetailsElement>('details[data-gaokao-process-kind="admission-score"]'),
+        );
+
+        toolDetails.forEach((detail) => {
+          detail.style.display = "";
+        });
+
+        if (toolDetails.length < 2) return;
+
+        const runningDetail = toolDetails.find((detail) => detail.dataset.gaokaoRunning === "true");
+        const anchorDetail = runningDetail ?? toolDetails[0];
+        const activeSchool = anchorDetail.dataset.gaokaoSchool || "院校";
+        const group = document.createElement("details");
+        group.className = "gaokao-tool-process-group my-2 px-3 text-xs text-zinc-600";
+        if (runningDetail || wasGroupOpen) group.open = true;
+
+        const summary = document.createElement("summary");
+        summary.className = "flex cursor-pointer list-none items-center gap-2 rounded-xl bg-white/70 px-3 py-2 font-medium text-zinc-600 ring-1 ring-zinc-200/80";
+
+        const icon = document.createElement("span");
+        icon.className =
+          "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-50 text-zinc-500 ring-1 ring-zinc-200";
+        icon.textContent = "⌕";
+
+        const title = document.createElement("span");
+        title.className = "min-w-0 flex-1 truncate";
+        title.textContent = runningDetail
+          ? `查询${activeSchool}中`
+          : `分数线查询过程 · ${toolDetails.length} 所学校`;
+
+        const badge = document.createElement("span");
+        badge.className = runningDetail
+          ? "shrink-0 rounded border border-red-100 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-700"
+          : "shrink-0 rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700";
+        badge.textContent = runningDetail ? "进行中" : "已折叠";
+
+        summary.append(icon, title, badge);
+
+        const body = document.createElement("div");
+        body.className = "ml-7 grid max-h-72 gap-2 overflow-y-auto border-l border-zinc-200 px-3 py-1.5";
+
+        toolDetails.forEach((detail, index) => {
+          const school = detail.dataset.gaokaoSchool || `学校 ${index + 1}`;
+          const isRunning = detail.dataset.gaokaoRunning === "true";
+          const item = document.createElement("details");
+          item.className = "rounded-lg bg-white/55 px-2 py-1.5 ring-1 ring-zinc-200/70";
+          item.open = isRunning;
+
+          const itemSummary = document.createElement("summary");
+          itemSummary.className = "cursor-pointer list-none text-[11px] font-black text-zinc-700";
+          itemSummary.textContent = isRunning ? `查询${school}中` : `已查询${school}`;
+
+          const content = detail.querySelector<HTMLElement>(":scope > div");
+          item.append(itemSummary);
+          if (content) item.append(content.cloneNode(true));
+          body.append(item);
+        });
+
+        group.append(summary, body);
+        anchorDetail.parentElement?.insertBefore(group, toolDetails[0]);
+        toolDetails.forEach((detail) => {
+          detail.style.display = "none";
+        });
+      });
+
+      window.setTimeout(() => {
+        suppressObserver = false;
+      }, 0);
+    };
+
+    const scheduleCompact = () => {
+      if (suppressObserver) return;
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(compact);
+    };
+
+    compact();
+    const observer = new MutationObserver(scheduleCompact);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [activeSessionId]);
+}
+
 function AdvisorChatSurface() {
   useMobileVisualViewport();
+  const dashboardScrollRef = useRef<HTMLElement | null>(null);
 
   const {
     activeSessionId,
     autoRenameSessionFromPrompt,
     createNewSession,
-    deleteSession,
-    renameSession,
-    sessions,
-    setActiveSessionId,
   } = useLocalSessions();
+  useCompactAdmissionScoreToolGroups(activeSessionId);
   const { activeProfile, updateProfileFromPatch } = useLocalProfiles(activeSessionId);
   const {
     activeSessionSummary,
     activeTurnContext,
     activeSuggestions,
     upsertTurnContext,
+    upsertSuggestions,
   } = useSessionInsights(activeSessionId);
   const rankHydrationKeyRef = useRef("");
+  const manuallySubmittedPromptRef = useRef<{ prompt: string; submittedAt: number } | null>(null);
   const hydrateRankForTurnContext = useCallback(
     (sessionId: string, turnContext: TurnContext, lastAssistantText: string) => {
       if (!canAutoHydrateRank(turnContext.profileAfterTurn)) return;
@@ -2187,14 +2916,18 @@ function AdvisorChatSurface() {
       upsertTurnContext,
     ],
   );
-  useAutoSessionTitle(activeSessionId, handlePromptSubmitted);
-  const { triggerMobileSend } = useMobileSendBridge(activeSessionId);
-
-  const activeSession = sessions.find((session) => session.id === activeSessionId) ?? sessions[0];
-  const displayActiveProfile = withDerivedProfile(activeProfile);
+  useAutoSessionTitle(activeSessionId, handlePromptSubmitted, manuallySubmittedPromptRef);
   const authoritativeProfile = withDerivedProfile(activeTurnContext?.profileAfterTurn ?? activeProfile);
-  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState("");
+  const missingFields = prioritizeMissingFields(authoritativeProfile, "", activeTurnContext?.missingPriority).slice(0, 8);
+  const completion = profileCompletion(authoritativeProfile);
+  const strategySummary = buildStrategySummary(authoritativeProfile, missingFields);
+  const dashboardSuggestions = uniqueTextItems([...activeSuggestions, ...FALLBACK_SUGGESTIONS]).slice(0, 7);
+  useAssistantSuggestionRefresh({
+    activeSessionId,
+    profile: authoritativeProfile,
+    missingPriority: activeTurnContext?.missingPriority,
+    upsertSuggestions,
+  });
 
   useEffect(() => {
     const hydrationKey = [
@@ -2244,41 +2977,19 @@ function AdvisorChatSurface() {
     upsertTurnContext,
   ]);
 
-  const startRenamingSession = useCallback(() => {
-    setRenameDraft(activeSession?.title ?? "志愿填报");
-    setRenamingSessionId(activeSessionId);
-  }, [activeSession?.title, activeSessionId]);
-
-  const commitRenamingSession = useCallback(() => {
-    if (!renamingSessionId) return;
-    renameSession(renamingSessionId, renameDraft);
-    setRenamingSessionId(null);
-    setRenameDraft("");
-  }, [renameDraft, renameSession, renamingSessionId]);
-
-  const cancelRenamingSession = useCallback(() => {
-    setRenamingSessionId(null);
-    setRenameDraft("");
-  }, []);
-
   useAgentContext({
-    description: "当前产品形态和会话",
+    description: "会话边界与全局规则",
     value:
-      `手机端高考志愿聊天 agent。当前 threadId=${activeSessionId}。` +
-      `${GAOKAO_STAGE_CONTEXT}` +
-      "这是一个独立本地会话，只能使用当前 threadId 的消息和当前本地画像，不要引用其他会话的画像或偏好。" +
-      "不要让用户填表，直接通过自然对话收集高考省份、科类、分数、位次、家庭预算、目标城市/地区偏好、读研意愿和风险偏好。" +
-      "高考省份是考生参加高考和投档的省份；目标城市/地区是想去读大学的地方，二者不能混用。" +
-      "当前权威画像优先级最高；如果它与历史聊天、会话摘要或旧工具结果冲突，必须以当前权威画像为准。例如当前权威画像 score=530 时，历史里出现过 590 也必须忽略 590。" +
-      "如果当前权威画像已有高考省份、科类/类别和分数但缺位次，前端会尝试用本地一分一段结构化库自动补全 rank；补全后的 rank 必须作为当前画像使用。" +
-      `当前权威画像：${JSON.stringify(authoritativeProfile)}。` +
-      `当前本地画像：${JSON.stringify(displayActiveProfile)}。` +
-      `画像缺失项：${getMissingProfileFields(authoritativeProfile)
-        .map((field) => field.label)
-        .join("、") || "无"}。` +
-      `当前会话摘要：${activeSessionSummary || "暂无"}。` +
-      `本轮关键信息：${JSON.stringify(activeTurnContext ?? null)}。` +
-      `建议回复模板：${activeSuggestions.join("；") || "暂无"}。`,
+      `threadId=${activeSessionId}; ${GAOKAO_STAGE_CONTEXT}` +
+      "每个可视化板块由独立 panel agent 上下文负责，不要把全部用户画像当成单一提示词环境。" +
+      "高考省份是投档省份，目标城市是就读偏好；当前画像优先级高于历史聊天文本。",
+  });
+  usePanelAgentContexts({
+    activeSessionId,
+    profile: authoritativeProfile,
+    missingFields,
+    summary: strategySummary,
+    suggestions: dashboardSuggestions,
   });
 
   useComponent({
@@ -2342,144 +3053,92 @@ function AdvisorChatSurface() {
     [],
   );
 
+  const handleExportReport = useCallback(() => {
+    const markdown = buildReportMarkdown({
+      profile: authoritativeProfile,
+      missingFields,
+      summary: strategySummary.body,
+    });
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `gaokao-advisor-${new Date().toISOString().slice(0, 10)}.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [authoritativeProfile, missingFields, strategySummary.body]);
+
+  const handleSubmitPrompt = useCallback((prompt: string) => {
+    manuallySubmittedPromptRef.current = { prompt, submittedAt: Date.now() };
+    handlePromptSubmitted(activeSessionId, prompt);
+    submitHiddenCopilotPrompt(prompt);
+    window.setTimeout(() => {
+      dashboardScrollRef.current?.scrollTo({
+        top: dashboardScrollRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }, 120);
+  }, [activeSessionId, handlePromptSubmitted]);
+  const handleIgnoreMissing = useCallback(() => {
+    const prompt = "忽略所有待补信息，直接基于当前画像给出志愿填报意见摘要。请明确说明由于信息不完整，建议只作为初步参考。";
+    handleSubmitPrompt(prompt);
+  }, [handleSubmitPrompt]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const scrollRoot = dashboardScrollRef.current;
+    if (!scrollRoot) return;
+
+    const messageList = document.querySelector('[data-testid="copilot-message-list"]');
+    if (!messageList) return;
+
+    let frame = 0;
+    const scrollToLatest = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        scrollRoot.scrollTo({
+          top: scrollRoot.scrollHeight,
+          behavior: "smooth",
+        });
+      });
+    };
+
+    const observer = new MutationObserver(scrollToLatest);
+    observer.observe(messageList, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [activeSessionId]);
+
   return (
-    <div className="gaokao-agent-shell mx-auto flex h-dvh min-h-0 w-full max-w-[480px] flex-col overflow-hidden bg-white text-zinc-950 shadow-2xl shadow-zinc-200/60">
-      <header className="border-b border-zinc-200 bg-white px-3 pb-3 pt-3">
-        <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-red-700 text-white">
-            <Icon name="message" className="h-4 w-4" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <h1 className="truncate text-base font-semibold">高考志愿填报 Agent</h1>
-            <p className="truncate text-xs text-zinc-500">官方数据优先 · DeepSeek · 2026 时间记忆</p>
-          </div>
-          <button
-            type="button"
-            onClick={createNewSession}
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-800 hover:bg-zinc-50"
-            aria-label="新会话"
-            title="新会话"
-          >
-            <Icon name="plus" />
-          </button>
+    <div className="gaokao-agent-shell mx-auto flex h-dvh min-h-0 w-full max-w-[480px] flex-col overflow-hidden bg-[#f6f9ff] text-slate-950 shadow-2xl shadow-slate-200/70">
+      <main ref={dashboardScrollRef} className="gaokao-dashboard-scroll min-h-0 flex-1 overflow-y-auto pb-52">
+        <AppHeader onCreate={createNewSession} onExport={handleExportReport} />
+        <div className="grid gap-4">
+          <CandidateProfileCard
+            profile={authoritativeProfile}
+            completion={completion}
+            missingCount={missingFields.length}
+            strategySummary={strategySummary}
+            missingPriority={activeTurnContext?.missingPriority}
+            onIgnoreMissing={handleIgnoreMissing}
+          />
+          <AgentConversationPanel
+            activeSessionId={activeSessionId}
+            activeSuggestions={activeSuggestions}
+            toolsMenu={toolsMenu}
+          />
         </div>
-
-        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
-          {sessions.map((session) => {
-            const isActive = session.id === activeSessionId;
-            return (
-              <button
-                key={session.id}
-                type="button"
-                onClick={() => setActiveSessionId(session.id)}
-                aria-pressed={isActive}
-                className={`shrink-0 rounded-md border px-3 py-1.5 text-xs font-medium transition ${
-                  isActive
-                    ? "border-zinc-950 bg-zinc-950 text-white"
-                    : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
-                }`}
-              >
-                {session.title}
-              </button>
-            );
-          })}
-        </div>
-
-        <div className="mt-2 flex items-center justify-between gap-2 text-xs text-zinc-500">
-          {renamingSessionId === activeSessionId ? (
-            <form
-              className="min-w-0 flex-1"
-              onSubmit={(event) => {
-                event.preventDefault();
-                commitRenamingSession();
-              }}
-            >
-              <input
-                autoFocus
-                value={renameDraft}
-                onBlur={commitRenamingSession}
-                onChange={(event) => setRenameDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    cancelRenamingSession();
-                  }
-                }}
-                className="h-7 w-full rounded border border-zinc-300 bg-white px-2 text-xs text-zinc-900 outline-none focus:border-red-700"
-                aria-label="会话名称"
-                maxLength={24}
-              />
-            </form>
-          ) : (
-            <span className="truncate">当前：{activeSession?.title ?? "志愿填报"}</span>
-          )}
-          <div className="flex shrink-0 gap-1">
-            <button
-              type="button"
-              onClick={startRenamingSession}
-              className="flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50"
-              aria-label="重命名当前会话"
-              title="重命名"
-            >
-              <Icon name="edit" className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => deleteSession(activeSessionId)}
-              className="flex h-7 w-7 items-center justify-center rounded border border-zinc-200 text-red-700 hover:bg-red-50"
-              aria-label="删除当前会话"
-              title="删除"
-            >
-              <Icon name="trash" className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </div>
-
-        <ProfileStrip profile={displayActiveProfile} missingPriority={activeTurnContext?.missingPriority} />
-      </header>
-
-      <main className="min-h-0 flex-1 overflow-hidden">
-        <CopilotChat
-          agentId="default"
-          className="gaokao-chat h-full"
-          threadId={activeSessionId}
-          key={activeSessionId}
-          labels={{
-            chatInputPlaceholder: activeSuggestions[0] || "直接问：海南高考 680 分能去什么学校？",
-            chatDisclaimerText: "重要志愿决策请以省考试院和院校官方数据为准。",
-            welcomeMessageText:
-              "我是志愿填报 agent，会先聊清楚省份、科类、分数、位次和家庭约束。问分数线时我会先查官方数据，再用图表说话。",
-            modalHeaderTitle: "高考志愿填报 Agent",
-          }}
-          input={{
-            showDisclaimer: true,
-            autoFocus: false,
-            toolsMenu,
-          }}
-          welcomeScreen={{
-            className: "px-4",
-          }}
-        />
       </main>
 
-      <SuggestionBar suggestions={activeSuggestions} />
-
-      <button
-        type="button"
-        className="gaokao-mobile-send-fallback"
-        onPointerDown={(event) => event.preventDefault()}
-        onPointerUp={(event) => {
-          event.preventDefault();
-          triggerMobileSend();
-        }}
-        onTouchEnd={(event) => {
-          event.preventDefault();
-          triggerMobileSend();
-        }}
-        aria-label="发送消息"
-      >
-        <Icon name="send" className="h-5 w-5" />
-      </button>
+      <PromptSuggestions suggestions={dashboardSuggestions} />
+      <TextComposerDock onSubmit={handleSubmitPrompt} />
     </div>
   );
 }

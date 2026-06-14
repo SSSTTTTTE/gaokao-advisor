@@ -588,6 +588,41 @@ const compareSchools = defineTool({
   },
 });
 
+// 通用对比卡片工具（用于非院校对比场景）
+const genericComparisonCard = defineTool({
+  name: "genericComparisonCard",
+  description:
+    "Render structured comparison cards for any 2-5 items (e.g., majors, cities, career paths, policies). Use this instead of Markdown tables for mobile-friendly display. Do NOT use for school comparisons; use compareSchools + schoolComparisonCard instead.",
+  parameters: z.object({
+    title: z.string().describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
+    items: z.array(
+      z.object({
+        name: z.string().describe("对比项名称，如'计算机科学与技术'"),
+        icon: z.string().optional().describe("图标（可选）"),
+        dimensions: z.array(
+          z.object({
+            label: z.string().describe("维度名称，如'学习内容'、'学习难度'、'就业前景'"),
+            value: z.string().describe("该维度的值"),
+          })
+        ).min(1).max(10).describe("对比维度列表"),
+        verdict: z.string().optional().describe("总结性判断（可选）"),
+      })
+    ).min(2).max(5).describe("对比项列表"),
+    summary: z.string().optional().describe("总结性建议"),
+    sources: z.array(cardSourceSchema).optional().default([]),
+    warnings: z.array(z.string()).optional().default([]),
+  }),
+  execute: async ({ title, items, summary, sources, warnings }) => {
+    return {
+      title,
+      items,
+      summary: summary ?? "以上对比仅供参考，请结合个人情况综合判断。",
+      sources: sources || [],
+      warnings: warnings || [],
+    };
+  },
+});
+
 function decodeHtmlEntities(value: string) {
   return value
     .replace(/&nbsp;/g, " ")
@@ -914,6 +949,12 @@ function buildAdvisorPrompt() {
 
 产品形态：手机端高考志愿聊天 agent。不要让用户填表，不要输出复杂后台说明，用自然对话推进。手机端禁止输出 Markdown 表格、HTML 表格、CSV 风格列对齐或用空格模拟表格（不要写 | 学校 | 建议 |，也不要输出 <table>）；录取分数线必须优先使用 scoreLineTrendChart，文字明细只用短列表，不要把 rows 复述成表格。凡是推荐 2 所及以上学校、多个专业组、冲稳保清单或学校对比，必须先调用受控 UI：volunteerPlanCards 或 schoolComparisonCard；正文只写最终判断，不得用表格承载学校清单。工具调用、检索动作、数据整理动作会由前端折叠成“思考过程/检索过程”，不要在正文里复述这些过程。关键决策输出优先使用受控 UI：studentProfileSummary、volunteerPlanCards、admissionRiskCards、schoolComparisonCard。
 
+**重要规则：凡是对比类问题（非院校对比），必须使用 genericComparisonCard + GenericComparisonCard 组件输出卡片式对比 UI。**
+- 适用场景：专业对比（如计算机 vs 软件工程）、城市对比（如南京 vs 杭州）、职业路径对比（如读研 vs 直接就业）、政策对比等
+- 不适用场景：院校对比（已有 schoolComparisonCard 专用组件）
+- 工作流程：先调用 genericComparisonCard 生成结构化对比数据，前端会自动渲染为卡片式 UI，每个对比项用独立卡片展示，包含多个维度的详细信息
+- 禁止行为：不要用 Markdown 表格、不要用纯文本罗列对比项、不要省略对比直接给结论
+
 工作方式：
 1. 先自然问清楚高考省份、科类/选科、分数、位次、家庭预算、目标城市/地区偏好、能不能读研、能否接受医学/军警/师范/出省。
 1a. 高考省份是考生参加高考和被投档的省份；目标城市/地区是想去读大学的地方。用户说“我是海南考生，想去新疆读”时，海南是高考省份，新疆是城市/地区偏好，不能把目标地区写成高考省份。
@@ -938,6 +979,67 @@ function buildAdvisorPrompt() {
 10. 当画像足够且用户要方案时，先调用 buildVolunteerPlan，再调用 volunteerPlanCards 渲染冲稳保卡片；正文只给 3-5 句最终判断。只要你的回答里准备出现 2 所及以上推荐学校或多个院校专业组，必须改为调用 volunteerPlanCards，不允许只在正文里列学校。
 11. 用户问普通家庭、专业避雷、不建议碰什么时，调用 explainAdmissionRisk，再调用 admissionRiskCards；必须明确“不建议碰/谨慎/可考虑”。
 12. 用户比较 2-3 所学校时，调用 compareSchools，再调用 schoolComparisonCard；必要时先查分数线或检索，但正文不写长篇对比。学校对比禁止用 Markdown 表格，必须用 schoolComparisonCard。
+12a. **凡是对比非院校内容（专业、城市、职业路径、政策等），必须先调用 genericComparisonCard，前端会自动渲染为卡片式 UI。**例如：
+- "计算机 vs 软件工程 vs 人工智能哪个更好" → 调用 genericComparisonCard
+- "南京和杭州哪个更适合读大学" → 调用 genericComparisonCard
+- "读研还是直接就业" → 调用 genericComparisonCard
+- 对比格式由 GenericComparisonCard 组件统一控制，Agent 只需提供结构化数据
+
+**genericComparisonCard 数据格式要求：**
+
+**核心概念：**
+- title: 对比主题，如"计算机 vs 软件工程 vs 人工智能"
+- items: 对比项数组，每个对比项包含：
+  - name: 对比项名称，如"计算机科学与技术"
+  - icon: 图标（可选）
+  - dimensions: 对比维度列表，每个维度包含 label（维度名称）和 value（该维度的值）
+  - verdict: 总结性判断（可选）
+- summary: 总结性建议（可选）
+
+**示例：**
+{
+  "title": "计算机 vs 软件工程 vs 人工智能",
+  "items": [
+    {
+      "name": "计算机科学与技术",
+      "dimensions": [
+        { "label": "学习内容", "value": "计算机底层原理、体系结构、操作系统、网络、编译原理" },
+        { "label": "学习难度", "value": "中等偏上，软硬结合，理论+实践均衡" },
+        { "label": "就业前景", "value": "最广，所有IT岗位通吃，体制内也认" },
+        { "label": "薪资水平", "value": "10K-20K/月，大厂Sp可到30K+" }
+      ],
+      "verdict": "适合数学基础好、喜欢底层原理的学生。"
+    },
+    {
+      "name": "软件工程",
+      "dimensions": [
+        { "label": "学习内容", "value": "软件开发全流程、工程化管理、代码实践、项目管理" },
+        { "label": "学习难度", "value": "入门较易，越学越偏实践，代码量大" },
+        { "label": "就业前景", "value": "很广，偏开发岗，大厂/中小厂需求量大" },
+        { "label": "薪资水平", "value": "8K-18K/月，大厂可到25K+" }
+      ],
+      "verdict": "适合动手能力强、想快速就业的学生。"
+    },
+    {
+      "name": "人工智能",
+      "dimensions": [
+        { "label": "学习内容", "value": "机器学习、深度学习、数据挖掘、计算机视觉、NLP、数学建模" },
+        { "label": "学习难度", "value": "最高，需要强数学（高数/线代/概率/最优化）基础" },
+        { "label": "就业前景", "value": "偏窄，核心AI算法岗大厂为主，门槛极高" },
+        { "label": "薪资水平", "value": "15K-30K/月，但基本要硕士起步" }
+      ],
+      "verdict": "适合数学极强、有读研规划的学生，普通家庭慎选。"
+    }
+  ],
+  "summary": "普通家庭优先选计算机或软件工程，AI需要强数学基础和读研规划。"
+}
+
+**关键规则：**
+1. items 数组长度 = 对比项数量（2-5个）
+2. 每个 item 的 dimensions 数组长度 = 该对比项的维度数量（至少1个，最多10个）
+3. dimension.label 是维度名称（如"学习内容"），dimension.value 是该维度的值
+4. 不要使用 headers/rows/values 这种表格结构，改用 items/dimensions 这种卡片结构
+
 13. 暂停使用 openGenerativeUI；关键分数线、画像、冲稳保、风险、学校对比只使用受控组件，保证手机端稳定。
 14. 输出格式要适合 390px 手机宽度：不用表格；用 3-6 条短句、短列表、分段判断。分数线明细由图表组件承载，不在正文中重复大段数据。
 14b. 追问多个问题时必须使用 Markdown 有序列表且每条独立换行，例如：
@@ -974,6 +1076,7 @@ const runtime = new CopilotRuntime({
         buildVolunteerPlan,
         explainAdmissionRisk,
         compareSchools,
+        genericComparisonCard,
         researchGaokaoData,
       ],
     }),

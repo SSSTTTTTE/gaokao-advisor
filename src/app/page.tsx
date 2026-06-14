@@ -237,7 +237,7 @@ function Icon({
   name,
   className = "h-4 w-4",
 }: {
-  name: "plus" | "trash" | "edit" | "search" | "chart" | "message" | "clock" | "send";
+  name: "plus" | "trash" | "edit" | "search" | "chart" | "message" | "clock" | "send" | "check";
   className?: string;
 }) {
   const common = {
@@ -287,6 +287,8 @@ function Icon({
           <path d="M12 19V5" />
           <path d="m5 12 7-7 7 7" />
         </>
+      ) : name === "check" ? (
+        <path d="M20 6 9 17l-5-5" />
       ) : (
         <>
           <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
@@ -963,12 +965,15 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
   const previousPoint = points.at(-2);
   const delta = latestPoint && previousPoint ? latestPoint.score - previousPoint.score : null;
 
-  const trendPoints = points.map((point, index) => {
+  // 按年份升序排列，确保横坐标从左到右是时间递增
+  const sortedPoints = [...points].sort((a, b) => a.year - b.year);
+  
+  const trendPoints = sortedPoints.map((point, index) => {
     const plotWidth = width - padding.left - padding.right;
     const plotHeight = trendHeight - padding.top - padding.bottom;
     const x =
       padding.left +
-      (points.length === 1 ? plotWidth / 2 : (index / (points.length - 1)) * plotWidth);
+      (sortedPoints.length === 1 ? plotWidth / 2 : (index / (sortedPoints.length - 1)) * plotWidth);
     const y = padding.top + ((maxScore - point.score) / scoreRange) * plotHeight;
     return { ...point, x, y };
   });
@@ -1164,7 +1169,7 @@ function ScoreLineTrendChart(args: ScoreLineTrendChartArgs) {
               <CpuChipIcon className="h-4 w-4" />
             </span>
             <div className="min-w-0">
-              <p className="text-sm font-black text-blue-950">趋势子 agent 解读</p>
+              <p className="text-sm font-black text-blue-950">趋势解读</p>
               <div className="mt-1 space-y-1.5 text-sm leading-6 text-slate-700">
                 {analysisLines.map((line, index) => (
                   <p key={`${line}-${index}`} className="break-words">
@@ -1444,9 +1449,9 @@ function SchoolComparisonCard({ schools, sources = [], warnings = [] }: SchoolCo
           safeSchools.map((school) => (
           <article key={school.schoolName} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
             <div className="flex items-start justify-between gap-2">
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                  <h4 className="break-words text-sm font-semibold">{school.schoolName}</h4>
+                  <h4 className="text-sm font-semibold">{school.schoolName}</h4>
                   {school.schoolName ? (
                     <button
                       type="button"
@@ -1463,10 +1468,10 @@ function SchoolComparisonCard({ schools, sources = [], warnings = [] }: SchoolCo
               </span>
             </div>
             <div className="mt-2 grid gap-1 text-xs leading-5 text-zinc-700">
-              <p>城市：{school.cityValue}</p>
-              <p>专业：{school.majorFit}</p>
-              <p>就业：{school.employmentView}</p>
-              <p>家庭适配：{school.familyFit}</p>
+              <p>城市：{school.cityValue || "待补充"}</p>
+              <p>专业：{school.majorFit || "待补充"}</p>
+              <p>就业：{school.employmentView || "待补充"}</p>
+              <p>家庭适配：{school.familyFit || "待补充"}</p>
             </div>
             <p className="mt-2 rounded-md bg-white px-2 py-1.5 text-xs font-medium leading-5 text-zinc-900">
               {school.verdict}
@@ -1486,6 +1491,126 @@ function SchoolComparisonCard({ schools, sources = [], warnings = [] }: SchoolCo
           ))}
         </div>
       ) : null}
+      {safeSources.length > 0 ? <SourceList sources={safeSources} /> : null}
+    </div>
+  );
+}
+
+// 通用对比卡片组件（用于非院校对比场景，如专业、城市、职业路径等）
+function GenericComparisonCard({
+  title,
+  items,
+  summary,
+  sources = [],
+  warnings = [],
+}: {
+  title: string;
+  items: Array<{
+    name: string;           // 对比项名称，如"计算机科学与技术"
+    icon?: string;          // 图标（可选）
+    dimensions: Array<{     // 对比维度列表
+      label: string;        // 维度名称，如"学习内容"
+      value: string;        // 该维度的值
+    }>;
+    verdict?: string;       // 总结性判断（可选）
+  }>;
+  summary?: string;
+  sources?: Array<{ id: string; title: string; url?: string; publisher?: string; kind?: string }>;
+  warnings?: Array<string>;
+}) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const safeSources = Array.isArray(sources) ? sources : [];
+  const safeWarnings = Array.isArray(warnings) ? warnings : [];
+
+  // 清理 Markdown 格式标记，但保留 **粗体** 并转换为 <strong> 标签
+  const processMarkdown = (text: string): string => {
+    if (!text) return "";
+    return text
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")  // **粗体** → <strong>粗体</strong>
+      .replace(/\*(.+?)\*/g, "$1")      // 移除 *斜体*
+      .replace(/__(.+?)__/g, "<strong>$1</strong>")  // __粗体__ → <strong>粗体</strong>
+      .replace(/_(.+?)_/g, "$1");       // 移除 _斜体_
+  };
+
+  // 将文本按换行符分割为数组，用于渲染多行文本（同时处理 Markdown）
+  const splitTextByLines = (text: string): string[] => {
+    if (!text) return [];
+    // 按 \n 或 \r\n 分割，过滤空行
+    return text.split(/\r?\n/).filter(line => line.trim());
+  };
+
+  return (
+    <div className="my-3 rounded-lg border border-blue-100 bg-white p-3 text-zinc-950 shadow-sm">
+      <p className="text-xs font-semibold text-blue-700">对比分析</p>
+      <h3 className="mt-1 text-base font-semibold">{title}</h3>
+      
+      {/* 对比项卡片网格 */}
+      <div className="mt-3 grid gap-3">
+        {safeItems.length ? (
+          safeItems.map((item) => (
+            <article key={item.name} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
+              {/* 标题栏 */}
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <h4 className="break-words text-sm font-semibold whitespace-normal">
+                    {item.icon && <span className="mr-1">{item.icon}</span>}
+                    {item.name}
+                  </h4>
+                </div>
+              </div>
+              
+              {/* 对比维度列表 */}
+              <div className="mt-2 grid gap-1.5 text-xs leading-5 text-zinc-700">
+                {Array.isArray(item.dimensions) && item.dimensions.map((dim, idx) => (
+                  <div key={idx} className="flex gap-2">
+                    <span className="shrink-0 font-medium text-zinc-600">{processMarkdown(dim.label)}：</span>
+                    <span className="flex-1">{processMarkdown(dim.value)}</span>
+                  </div>
+                ))}
+              </div>
+              
+              {/* 总结性判断 */}
+              {item.verdict ? (
+                <p className="mt-2 rounded-md bg-white px-2 py-1.5 text-xs font-medium leading-5 text-zinc-900">
+                  {processMarkdown(item.verdict)}
+                </p>
+              ) : null}
+            </article>
+          ))
+        ) : (
+          <p className="rounded-md bg-zinc-50 px-3 py-2 text-xs leading-5 text-zinc-600">
+            对比数据不足，请至少给出 2 个对比项。
+          </p>
+        )}
+      </div>
+
+      {/* 总结建议 */}
+      {summary ? (
+        <div className="mt-3 rounded-md bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-900">
+          <p className="font-semibold">总结：</p>
+          <div className="mt-1 space-y-1">
+            {splitTextByLines(summary).map((line, idx) => {
+              const processedLine = processMarkdown(line);
+              // 如果包含 HTML 标签，使用 dangerouslySetInnerHTML
+              if (processedLine.includes('<strong>')) {
+                return <p key={idx} dangerouslySetInnerHTML={{ __html: processedLine }} />;
+              }
+              return <p key={idx}>{processedLine}</p>;
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {/* 警告信息 */}
+      {safeWarnings.length > 0 ? (
+        <div className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+          {safeWarnings.slice(0, 2).map((warning) => (
+            <p key={warning}>{processMarkdown(warning)}</p>
+          ))}
+        </div>
+      ) : null}
+
+      {/* 来源列表 */}
       {safeSources.length > 0 ? <SourceList sources={safeSources} /> : null}
     </div>
   );
@@ -1542,6 +1667,7 @@ function ToolReasoning({
     name === "volunteerPlanCards" ||
     name === "admissionRiskCards" ||
     name === "schoolComparisonCard" ||
+    name === "genericComparisonCard" ||
     name === "render_a2ui" ||
     name === "generate_a2ui"
   ) {
@@ -1597,19 +1723,34 @@ function ToolReasoning({
   return (
     <details
       open={isRunning}
-      className="my-2 px-3 text-xs text-zinc-600"
-      data-gaokao-process-kind={name === "lookupAdmissionScores" ? "admission-score" : undefined}
+      className="my-2 px-3 text-xs"
+      data-gaokao-process-kind="agent-thinking"
+      data-gaokao-tool-type={name}
       data-gaokao-school={queriedSchool || undefined}
       data-gaokao-running={isRunning ? "true" : "false"}
     >
-      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-xl bg-white/70 px-3 py-2 font-medium text-zinc-600 ring-1 ring-zinc-200/80">
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-50 text-zinc-500 ring-1 ring-zinc-200">
-          <Icon
-            name={name === "lookupAdmissionScores" || name === "researchGaokaoData" ? "search" : "clock"}
-            className="h-3 w-3"
-          />
+      <summary className={`flex cursor-pointer list-none items-center gap-2 rounded-xl px-3 py-2 font-medium ring-1 transition-colors ${
+        isRunning
+          ? "bg-white/50 text-zinc-600 ring-zinc-200/80 hover:bg-white/70"
+          : "bg-white/50 text-zinc-400 ring-zinc-100/50"
+      }`}>
+        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-1 ${
+          isRunning
+            ? "bg-blue-50 text-blue-500 ring-blue-200"
+            : "bg-emerald-50 text-emerald-500 ring-emerald-200"
+        }`}>
+          {isRunning ? (
+            <span className="gaokao-spin inline-block">
+              <Icon
+                name={name === "lookupAdmissionScores" || name === "researchGaokaoData" ? "search" : "clock"}
+                className="h-3 w-3"
+              />
+            </span>
+          ) : (
+            <Icon name="check" className="h-3 w-3" />
+          )}
         </span>
-        <span className="min-w-0 flex-1 truncate">
+        <span className={`min-w-0 flex-1 truncate ${isRunning ? "text-zinc-600" : "text-zinc-400"}`}>
           {processLabel} · {label}
         </span>
         <span
@@ -1619,13 +1760,17 @@ function ToolReasoning({
               : "border-emerald-100 bg-emerald-50 text-emerald-700"
           }`}
         >
-          {isRunning ? "进行中" : "已折叠"}
+          {isRunning ? "进行中" : "已完成"}
         </span>
       </summary>
       {entries.length > 0 ? (
-        <div className="ml-7 grid max-h-48 gap-2 overflow-y-auto border-l border-zinc-200 px-3 py-1.5">
+        <div className={`ml-7 grid max-h-48 gap-2 overflow-y-auto border-l px-3 py-1.5 ${
+          isRunning ? "border-zinc-200/50" : "border-zinc-100/50"
+        }`}>
           {entries.slice(0, 5).map(([key, value]) => (
-            <div key={key} className="min-w-0 rounded-lg bg-white/55 px-2 py-1.5 ring-1 ring-zinc-200/70">
+            <div key={key} className={`min-w-0 rounded-lg px-2 py-1.5 ring-1 ${
+              isRunning ? "bg-white/50 ring-zinc-200/50" : "bg-white/50 ring-zinc-100/50"
+            }`}>
               <span className="block text-[11px] font-black text-zinc-500">{key}</span>
               <pre className="mt-1 max-w-full whitespace-pre-wrap break-words font-sans text-[11px] leading-4 text-zinc-700">
                 {formatToolValue(value)}
@@ -2728,77 +2873,192 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
     let frame = 0;
     let suppressObserver = false;
 
+    // 定义所有需要被分组的工具类型
+    const PROCESS_TOOL_TYPES = [
+      "lookupAdmissionScores",      // 分数线查询
+      "lookupRankByScore",          // 位次查询
+      "researchGaokaoData",         // 联网检索
+      "compareSchools",             // 院校对比
+      "buildVolunteerPlan",         // 冲稳保方案
+      "explainAdmissionRisk",       // 风险解释
+    ];
+
     const compact = () => {
       suppressObserver = true;
       const assistantMessages = Array.from(document.querySelectorAll<HTMLElement>(".copilotKitAssistantMessage"));
 
       assistantMessages.forEach((message) => {
-        const wasGroupOpen = Boolean(message.querySelector<HTMLDetailsElement>(".gaokao-tool-process-group")?.open);
-        message.querySelectorAll(".gaokao-tool-process-group").forEach((node) => node.remove());
-        const toolDetails = Array.from(
-          message.querySelectorAll<HTMLDetailsElement>('details[data-gaokao-process-kind="admission-score"]'),
+        // 收集所有需要分组的 tool details（包括已存在的分组和原始节点）
+        const allProcessDetails = Array.from(
+          message.querySelectorAll<HTMLDetailsElement>('details[data-gaokao-process-kind="agent-thinking"]'),
         );
 
-        toolDetails.forEach((detail) => {
-          detail.style.display = "";
+        // 调试：记录找到的 process details 数量
+        if (process.env.NODE_ENV === "development" && allProcessDetails.length > 0) {
+          console.log(`[Compact] Found ${allProcessDetails.length} agent-thinking tools in message`, 
+            allProcessDetails.map(d => ({ 
+              kind: d.dataset.gaokaoProcessKind,
+              type: d.dataset.gaokaoToolType,
+              running: d.dataset.gaokaoRunning,
+              hasGroup: d.classList.contains('gaokao-tool-process-group')
+            })));
+        }
+
+        // 少于 2 个不需要分组，但需要确保它们都是折叠状态（非运行中）
+        if (allProcessDetails.length < 2) {
+          allProcessDetails.forEach((detail) => {
+            // 跳过已经是分组面板的节点
+            if (detail.classList.contains('gaokao-tool-process-group')) return;
+            
+            const isRunning = detail.dataset.gaokaoRunning === "true";
+            detail.open = isRunning; // 只有运行中的才展开
+            detail.style.display = ""; // 恢复显示
+          });
+          return;
+        }
+
+        // 检查是否有正在运行的工具调用
+        const runningDetail = allProcessDetails.find((detail) => detail.dataset.gaokaoRunning === "true");
+        const anchorDetail = runningDetail ?? allProcessDetails[0];
+        
+        // 统计各类型的数量
+        const typeCounts: Record<string, number> = {};
+        allProcessDetails.forEach(detail => {
+          const type = detail.dataset.gaokaoToolType || 'unknown';
+          typeCounts[type] = (typeCounts[type] || 0) + 1;
         });
-
-        if (toolDetails.length < 2) return;
-
-        const runningDetail = toolDetails.find((detail) => detail.dataset.gaokaoRunning === "true");
-        const anchorDetail = runningDetail ?? toolDetails[0];
-        const activeSchool = anchorDetail.dataset.gaokaoSchool || "院校";
-        const group = document.createElement("details");
-        group.className = "gaokao-tool-process-group my-2 px-3 text-xs text-zinc-600";
-        if (runningDetail || wasGroupOpen) group.open = true;
-
-        const summary = document.createElement("summary");
-        summary.className = "flex cursor-pointer list-none items-center gap-2 rounded-xl bg-white/70 px-3 py-2 font-medium text-zinc-600 ring-1 ring-zinc-200/80";
-
-        const icon = document.createElement("span");
-        icon.className =
-          "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-50 text-zinc-500 ring-1 ring-zinc-200";
-        icon.textContent = "⌕";
-
-        const title = document.createElement("span");
-        title.className = "min-w-0 flex-1 truncate";
-        title.textContent = runningDetail
-          ? `查询${activeSchool}中`
-          : `分数线查询过程 · ${toolDetails.length} 所学校`;
-
-        const badge = document.createElement("span");
-        badge.className = runningDetail
-          ? "shrink-0 rounded border border-red-100 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-700"
-          : "shrink-0 rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700";
-        badge.textContent = runningDetail ? "进行中" : "已折叠";
-
-        summary.append(icon, title, badge);
-
-        const body = document.createElement("div");
-        body.className = "ml-7 grid max-h-72 gap-2 overflow-y-auto border-l border-zinc-200 px-3 py-1.5";
-
-        toolDetails.forEach((detail, index) => {
-          const school = detail.dataset.gaokaoSchool || `学校 ${index + 1}`;
-          const isRunning = detail.dataset.gaokaoRunning === "true";
-          const item = document.createElement("details");
-          item.className = "rounded-lg bg-white/55 px-2 py-1.5 ring-1 ring-zinc-200/70";
-          item.open = isRunning;
-
-          const itemSummary = document.createElement("summary");
-          itemSummary.className = "cursor-pointer list-none text-[11px] font-black text-zinc-700";
-          itemSummary.textContent = isRunning ? `查询${school}中` : `已查询${school}`;
-
-          const content = detail.querySelector<HTMLElement>(":scope > div");
-          item.append(itemSummary);
-          if (content) item.append(content.cloneNode(true));
-          body.append(item);
-        });
-
-        group.append(summary, body);
-        anchorDetail.parentElement?.insertBefore(group, toolDetails[0]);
-        toolDetails.forEach((detail) => {
+        
+        // 构建标题文本
+        const typeLabels: Record<string, string> = {
+          lookupAdmissionScores: "分数线查询",
+          lookupRankByScore: "位次查询",
+          researchGaokaoData: "联网检索",
+          compareSchools: "院校对比",
+          buildVolunteerPlan: "冲稳保方案",
+          explainAdmissionRisk: "风险解释",
+        };
+        
+        const titleParts = Object.entries(typeCounts)
+          .filter(([_, count]) => count > 0)
+          .map(([type, count]) => `${typeLabels[type] || type}${count > 1 ? `×${count}` : ''}`)
+          .join("、");
+        
+        const groupTitle = runningDetail
+          ? `思考中 · ${titleParts}`
+          : `思考过程 · ${titleParts}`;
+        
+        // 创建或复用分组面板
+        let group = message.querySelector<HTMLDetailsElement>(".gaokao-tool-process-group");
+        if (!group) {
+          group = document.createElement("details");
+          group.className = "gaokao-tool-process-group my-2 px-3 text-xs";
+          // 只有在有运行中的工具时才展开分组，完成后自动折叠
+          if (runningDetail) group.open = true;
+          
+          const summary = document.createElement("summary");
+          summary.className = "flex cursor-pointer list-none items-center gap-2 rounded-xl bg-white/50 px-3 py-2 font-medium text-zinc-600 ring-1 ring-zinc-200/80 hover:bg-white/70 transition-colors";
+          
+          const icon = document.createElement("span");
+          icon.className = "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-blue-50 text-blue-500 ring-1 ring-blue-200";
+          icon.innerHTML = `<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"/></svg>`;
+          
+          const title = document.createElement("span");
+          title.className = "min-w-0 flex-1 truncate";
+          title.textContent = groupTitle;
+          
+          const badge = document.createElement("span");
+          badge.className = runningDetail
+            ? "shrink-0 rounded border border-red-100 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-700"
+            : "shrink-0 rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700";
+          badge.textContent = runningDetail ? "进行中" : "已完成";
+          
+          summary.append(icon, title, badge);
+          
+          const body = document.createElement("div");
+          body.className = "ml-7 grid max-h-96 gap-2 overflow-y-auto border-l border-zinc-200/50 px-3 py-1.5";
+          
+          group.append(summary, body);
+          anchorDetail.parentElement?.insertBefore(group, allProcessDetails[0]);
+        } else {
+          // 更新现有分组的标题和状态
+          const summary = group.querySelector("summary");
+          if (summary) {
+            const titleEl = summary.querySelector("span.min-w-0");
+            if (titleEl) titleEl.textContent = groupTitle;
+            
+            const badgeEl = summary.querySelector("span.shrink-0");
+            if (badgeEl) {
+              badgeEl.textContent = runningDetail ? "进行中" : "已完成";
+              badgeEl.className = runningDetail
+                ? "shrink-0 rounded border border-red-100 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-700"
+                : "shrink-0 rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700";
+            }
+          }
+          
+          // 更新展开状态
+          if (runningDetail && !group.open) {
+            group.open = true;
+          } else if (!runningDetail && group.open) {
+            // 只有在用户没有手动展开的情况下才自动折叠
+            // 这里简化处理：完成后始终折叠
+            group.open = false;
+          }
+        }
+        
+        // 更新分组内容
+        const body = group.querySelector("div.ml-7");
+        if (body) {
+          // 清空旧内容
+          body.innerHTML = "";
+          
+          // 添加每个工具调用的子项
+          allProcessDetails.forEach((detail, index) => {
+            // 跳过分组面板本身
+            if (detail.classList.contains('gaokao-tool-process-group')) return;
+            
+            const toolType = detail.dataset.gaokaoToolType || 'unknown';
+            const school = detail.dataset.gaokaoSchool;
+            const isRunning = detail.dataset.gaokaoRunning === "true";
+            
+            const item = document.createElement("details");
+            item.className = "rounded-lg bg-white/50 px-2 py-1.5 ring-1 ring-zinc-200/50";
+            item.open = isRunning;
+            
+            const itemSummary = document.createElement("summary");
+            itemSummary.className = "cursor-pointer list-none text-[11px] font-black text-zinc-700";
+            
+            let label = typeLabels[toolType] || toolType;
+            if (school) {
+              label = isRunning ? `查询${school}中` : `已查询${school}`;
+            } else {
+              label = isRunning ? `${label}中` : label;
+            }
+            itemSummary.textContent = label;
+            
+            const content = detail.querySelector<HTMLElement>(":scope > div");
+            item.append(itemSummary);
+            if (content) item.append(content.cloneNode(true));
+            body.append(item);
+          });
+        }
+        
+        // 隐藏所有原始的 tool details，只显示分组面板
+        allProcessDetails.forEach((detail) => {
+          // 跳过分组面板本身
+          if (detail.classList.contains('gaokao-tool-process-group')) return;
+          
           detail.style.display = "none";
+          detail.style.visibility = "hidden";
+          detail.style.height = "0";
+          detail.style.overflow = "hidden";
+          detail.style.margin = "0";
+          detail.style.padding = "0";
         });
+        
+        // 调试日志：确认分组是否正确创建
+        if (process.env.NODE_ENV === "development") {
+          console.log(`[Compact] Grouped ${allProcessDetails.filter(d => !d.classList.contains('gaokao-tool-process-group')).length} agent-thinking tools, running=${!!runningDetail}, groupOpen=${group?.open}`);
+        }
       });
 
       window.setTimeout(() => {
@@ -2806,10 +3066,20 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
       }, 0);
     };
 
-    const scheduleCompact = () => {
+    const scheduleCompact = (mutations?: MutationRecord[]) => {
       if (suppressObserver) return;
-      if (frame) window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(compact);
+      
+      // 如果是属性变化（如 data-gaokao-running），立即执行
+      const hasAttributeChange = mutations?.some(m => m.type === 'attributes');
+      
+      if (hasAttributeChange) {
+        // 立即执行，快速响应 tool call 状态变化
+        compact();
+      } else {
+        // DOM 结构变化使用 RAF 防抖
+        if (frame) window.cancelAnimationFrame(frame);
+        frame = window.requestAnimationFrame(compact);
+      }
     };
 
     compact();
@@ -2817,6 +3087,8 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
     observer.observe(document.body, {
       childList: true,
       subtree: true,
+      attributes: true, // 监听属性变化（如 data-gaokao-running 从 true 变为 false）
+      attributeFilter: ["data-gaokao-running", "open"], // 只关注相关属性
     });
 
     return () => {
@@ -3030,6 +3302,32 @@ function AdvisorChatSurface() {
     description: "对比 2-3 所学校的分数风险、城市价值、专业适配、就业路径和家庭适配。",
     parameters: schoolComparisonCardSchema,
     render: SchoolComparisonCard,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "genericComparisonCard",
+    description: "渲染通用对比卡片，用于非院校对比场景（如专业对比、城市对比、职业路径对比等）。每个对比项用独立卡片展示，包含多个维度的详细信息。",
+    parameters: z.object({
+      title: z.string().describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
+      items: z.array(
+        z.object({
+          name: z.string().describe("对比项名称，如'计算机科学与技术'"),
+          icon: z.string().optional().describe("图标（可选）"),
+          dimensions: z.array(
+            z.object({
+              label: z.string().describe("维度名称，如'学习内容'"),
+              value: z.string().describe("该维度的值"),
+            })
+          ).min(1).max(10).describe("对比维度列表"),
+          verdict: z.string().optional().describe("总结性判断（可选）"),
+        })
+      ).min(2).max(5).describe("对比项列表"),
+      summary: z.string().optional().describe("总结性建议"),
+      sources: z.array(cardSourceSchema).optional(),
+      warnings: z.array(z.string()).optional(),
+    }),
+    render: GenericComparisonCard,
     followUp: true,
   });
 

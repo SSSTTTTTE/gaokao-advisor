@@ -298,6 +298,19 @@ body {
   animation: gaokao-action-bounce 1.45s ease-in-out infinite;
 }
 
+@keyframes gaokao-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.gaokao-spin {
+  animation: gaokao-spin 1s linear infinite;
+}
+
 .gaokao-chat [data-testid="copilot-scroll-to-bottom"],
 .gaokao-chat button[aria-label*="bottom" i],
 .gaokao-chat button[aria-label*="底部"],
@@ -388,4 +401,23 @@ body {
 
 .gaokao-chat [data-testid="copilot-assistant-message"] tr > :last-child {
   border-bottom: 0 !important;
+}
+
+/* 重置受控 UI 组件内的表格样式影响 */
+.gaokao-chat [data-testid="copilot-assistant-message"] .rounded-md,
+.gaokao-chat [data-testid="copilot-assistant-message"] .rounded-lg,
+.gaokao-chat [data-testid="copilot-assistant-message"] article,
+.gaokao-chat [data-testid="copilot-assistant-message"] section {
+  word-break: normal !important;
+  white-space: normal !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] .rounded-md h4,
+.gaokao-chat [data-testid="copilot-assistant-message"] .rounded-lg h4,
+.gaokao-chat [data-testid="copilot-assistant-message"] article h4,
+.gaokao-chat [data-testid="copilot-assistant-message"] section h4 {
+  display: inline-block !important;
+  width: auto !important;
+  white-space: normal !important;
+  word-break: normal !important;
 }

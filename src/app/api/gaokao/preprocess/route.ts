@@ -1,16 +1,39 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { buildProfileKeyFacts, extractStudentProfilePatch, mergeStudentProfile, withDerivedStudentProfile } from "@/lib/agent/profile-extractor";
+import { routeAgentTurn } from "@/lib/agent/tool-router";
+import type { StudentProfile } from "@/lib/agent/types";
 
 export const dynamic = "force-dynamic";
 
-const TIME_CONTEXT =
-  "当前日期是 2026-06-13，时区 Asia/Shanghai。2026 年全国统考已于 2026-06-07 至 2026-06-08 举行；新高考地区可能延续到 2026-06-09 或 2026-06-10。现在是高考后查分/志愿准备阶段。";
+const TIME_ZONE = "Asia/Shanghai";
+
+function getCurrentDateForPrompt() {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "long",
+  }).format(new Date());
+}
+
+function timeContext() {
+  return `当前日期是 ${getCurrentDateForPrompt()}，时区 ${TIME_ZONE}。2026 年全国统考已于 2026-06-07 至 2026-06-08 举行；新高考地区可能延续到 2026-06-09 或 2026-06-10。现在是高考后查分/志愿准备阶段。`;
+}
 
 const profileSchema = z.object({
   province: z.string().optional(),
+  year: z.number().optional(),
   subjectTrack: z.string().optional(),
   score: z.number().optional(),
   rank: z.number().optional(),
+  targetCities: z.array(z.string()).optional(),
+  preferredMajors: z.array(z.string()).optional(),
+  familyBudget: z.string().optional(),
+  riskPreference: z.enum(["冲刺", "稳妥", "保守"]).optional(),
+  acceptPrivate: z.boolean().optional(),
+  acceptSinoForeign: z.boolean().optional(),
   budget: z.string().optional(),
   cityPreference: z.string().optional(),
   canLeaveProvince: z.boolean().optional(),
@@ -39,21 +62,21 @@ const responseSchema = z.object({
 });
 
 function fallbackResponse(input: z.infer<typeof requestSchema>, warning?: string) {
-  const suggestions: string[] = [];
-  if (!input.profile.rank && /能去|能上|报什么|怎么选|学校|大学|志愿|680|分/.test(input.rawPrompt)) {
-    suggestions.push("我的位次是：");
-  }
-  if (!input.profile.budget && /普通家庭|预算|学费|中外|费用/.test(input.rawPrompt)) {
-    suggestions.push("家里每年预算大概是：");
-  }
-  if (!input.profile.cityPreference && /城市|地区|想去|哪里读/.test(input.rawPrompt)) {
-    suggestions.push("我想去的城市/地区是：");
-  }
+  const profilePatch = extractStudentProfilePatch(input.rawPrompt);
+  const mergedProfile = withDerivedStudentProfile(
+    mergeStudentProfile(input.profile as StudentProfile, profilePatch),
+  );
+  const route = routeAgentTurn({ userMessage: input.rawPrompt, profile: mergedProfile });
+  const suggestions = route.nextQuestions
+    .flatMap((question) => question.options.map((option) => option.prompt ?? option.label))
+    .filter(Boolean)
+    .slice(0, 8);
+  const keyFacts = buildProfileKeyFacts(profilePatch, input.rawPrompt);
 
   return {
-    keyFacts: [TIME_CONTEXT],
-    profilePatch: {},
-    missingPriority: suggestions.includes("我的位次是：") ? ["rank"] : [],
+    keyFacts: [timeContext(), ...keyFacts].slice(0, 8),
+    profilePatch,
+    missingPriority: [...route.missingFields, ...route.suggestedFields].slice(0, 8),
     sessionSummary: [input.previousSummary, input.rawPrompt].filter(Boolean).join("；").slice(-220),
     suggestions,
     ambiguityWarnings: warning ? [warning] : [],
@@ -99,13 +122,13 @@ export async function POST(request: Request) {
             role: "system",
             content:
               "你是高考志愿填报 agent 的预处理器，只输出 JSON。不要给建议长文，不要编造分数线。高考省份是投档省份，目标城市/地区是想去读大学的地方，二者不能混用。" +
-              TIME_CONTEXT,
+              timeContext(),
           },
           {
             role: "user",
             content: JSON.stringify({
               task:
-                "从本轮用户输入中提取关键信息，给画像补丁、待补字段优先级、会话摘要和下一轮建议回复。字段名必须使用 province, subjectTrack, score, rank, budget, cityPreference, canLeaveProvince, graduatePlan, majorPreference, avoidMajors, familyType。",
+                "从本轮用户输入中提取关键信息，给画像补丁、待补字段优先级、会话摘要和下一轮建议回复。字段名优先使用 province, year, subjectTrack, score, rank, targetCities, preferredMajors, avoidMajors, familyBudget, riskPreference, acceptPrivate, acceptSinoForeign, graduatePlan, familyType；兼容旧字段 budget, cityPreference, canLeaveProvince, majorPreference。",
               rawPrompt: input.rawPrompt,
               currentProfile: input.profile,
               previousSummary: input.previousSummary,
@@ -138,7 +161,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       ...parsed,
-      keyFacts: [TIME_CONTEXT, ...parsed.keyFacts].slice(0, 8),
+      keyFacts: [timeContext(), ...parsed.keyFacts].slice(0, 8),
     });
   } catch (error) {
     return NextResponse.json(

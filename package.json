@@ -6,6 +6,7 @@
     "example-dev": "next dev",
     "example-build": "next build",
     "example-start": "next start",
+    "test:agent-router": "vitest run src/lib/agent/__tests__/tool-router.test.ts",
     "lint": "next lint",
     "clean": "rm -rf .turbo && rm -rf node_modules && rm -rf dist && rm -rf .next"
   },

@@ -5,7 +5,9 @@ import {
   CopilotKitProvider,
   defineToolCallRenderer,
   useAgentContext,
+  useAgent,
   useComponent,
+  useCopilotKit,
 } from "@copilotkit/react-core/v2";
 import {
   AcademicCapIcon,
@@ -29,6 +31,17 @@ import type { MutableRefObject, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { z } from "zod";
+import { buildAgentRouterContext } from "@/lib/agent/context-builder";
+import {
+  DEFAULT_RANK_REFERENCE_YEAR,
+  buildProfileKeyFacts,
+  extractStudentProfilePatch,
+  mergeStudentProfile,
+  normalizeProvinceForAgent,
+  withDerivedStudentProfile,
+} from "@/lib/agent/profile-extractor";
+import { routeAgentTurn } from "@/lib/agent/tool-router";
+import type { RouterDecision, StudentProfile as AgentStudentProfile } from "@/lib/agent/types";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +51,9 @@ const PROFILE_STORAGE_KEY = "gaokao-advisor.profileBySession";
 const SUMMARY_STORAGE_KEY = "gaokao-advisor.summaryBySession";
 const TURN_CONTEXT_STORAGE_KEY = "gaokao-advisor.turnContextBySession";
 const SUGGESTIONS_STORAGE_KEY = "gaokao-advisor.suggestionsBySession";
+const IGNORED_MISSING_STORAGE_KEY = "gaokao-advisor.ignoredMissingBySession";
+const PROFILE_PANEL_COLLAPSED_STORAGE_KEY = "gaokao-advisor.profilePanelCollapsedBySession";
+const RANK_META_STORAGE_KEY = "gaokao-advisor.rankMetaBySession";
 const COMPOSER_DRAFT_EVENT = "gaokao:set-composer-draft";
 const COPILOT_CHAT_TEXTAREA_SELECTOR = '[data-testid="copilot-chat-textarea"]';
 const COPILOT_SEND_BUTTON_SELECTOR = '[data-testid="copilot-send-button"]';
@@ -103,9 +119,16 @@ type ScoreLineTrendChartArgs = Partial<z.infer<typeof scoreLineTrendChartSchema>
 
 const studentProfileSchema = z.object({
   province: z.string().optional().describe("高考省份"),
+  year: z.number().optional().describe("高考年份或参考年份"),
   subjectTrack: z.string().optional().describe("科类或选科"),
   score: z.number().optional().describe("高考分数"),
   rank: z.number().optional().describe("位次"),
+  targetCities: z.array(z.string()).optional().describe("目标城市/地区"),
+  preferredMajors: z.array(z.string()).optional().describe("偏好的专业方向"),
+  familyBudget: z.string().optional().describe("家庭预算或学费承受能力"),
+  riskPreference: z.enum(["冲刺", "稳妥", "保守"]).optional().describe("风险偏好"),
+  acceptPrivate: z.boolean().optional().describe("是否接受民办"),
+  acceptSinoForeign: z.boolean().optional().describe("是否接受中外合作"),
   budget: z.string().optional().describe("家庭预算或学费承受能力"),
   cityPreference: z.string().optional().describe("城市偏好"),
   canLeaveProvince: z.boolean().optional().describe("是否接受出省"),
@@ -120,6 +143,28 @@ const studentProfileSummarySchema = z.object({
   profile: studentProfileSchema.optional(),
   missingFields: z.array(z.string()).optional(),
   nextQuestions: z.array(z.string()).optional(),
+});
+
+const followUpQuestionOptionsSchema = z.object({
+  questions: z
+    .array(
+      z.object({
+        field: z.string().optional().describe("关联画像字段，例如 rank、budget、cityPreference"),
+        question: z.string().describe("要追问用户的问题"),
+        options: z
+          .array(
+            z.object({
+              label: z.string().describe("按钮文案"),
+              value: z.string().optional().describe("选项值"),
+              prompt: z.string().optional().describe("点击后提交给 agent 的完整回复"),
+            }),
+          )
+          .min(1)
+          .max(6),
+      }),
+    )
+    .min(1)
+    .max(5),
 });
 
 const cardSourceSchema = z.object({
@@ -179,15 +224,25 @@ const schoolComparisonCardSchema = z.object({
 
 type StudentProfile = z.infer<typeof studentProfileSchema>;
 type StudentProfileSummaryArgs = z.infer<typeof studentProfileSummarySchema>;
+type FollowUpQuestionOptionsArgs = z.infer<typeof followUpQuestionOptionsSchema>;
 type VolunteerPlanCardsArgs = z.infer<typeof volunteerPlanCardsSchema>;
 type AdmissionRiskCardsArgs = z.infer<typeof admissionRiskCardsSchema>;
 type SchoolComparisonCardArgs = z.infer<typeof schoolComparisonCardSchema>;
+
+type RankMeta = {
+  year: number;
+  source: "user" | "auto2025";
+  matchedScore?: number;
+  note?: string;
+  sourceTitle?: string;
+};
 
 type TurnContext = {
   rawPrompt: string;
   keyFacts: string[];
   profilePatch: Partial<StudentProfile>;
   profileAfterTurn: StudentProfile;
+  toolRoute: RouterDecision;
   missingPriority: Array<keyof StudentProfile>;
   sessionSummary: string;
   suggestions: string[];
@@ -209,8 +264,11 @@ type RankHydrationResponse =
       status: "ok";
       rank: number;
       matchedScore: number;
+      year?: number;
       province: string;
       subjectTrack: string;
+      source?: { title?: string; url?: string };
+      rankSourceLabel?: string;
     }
   | {
       status: "not_found" | "error";
@@ -308,12 +366,22 @@ function formatScore(score: number | null | undefined) {
   return score.toLocaleString("zh-CN");
 }
 
-function profileCompletion(profile: StudentProfile | undefined) {
-  const filled = PROFILE_FIELDS.filter(({ key }) => {
+function normalizeIgnoredKeys(items: Array<string | keyof StudentProfile> | undefined) {
+  return normalizePriorityKeys(items);
+}
+
+function profileCompletion(
+  profile: StudentProfile | undefined,
+  ignoredFields: Array<string | keyof StudentProfile> = [],
+) {
+  const ignored = new Set(normalizeIgnoredKeys(ignoredFields));
+  const effectiveFields = PROFILE_FIELDS.filter(({ key }) => !ignored.has(key));
+  if (effectiveFields.length === 0) return 100;
+  const filled = effectiveFields.filter(({ key }) => {
     const value = profile?.[key];
     return value !== undefined && value !== "" && (!Array.isArray(value) || value.length > 0);
   }).length;
-  return Math.round((filled / PROFILE_FIELDS.length) * 100);
+  return Math.round((filled / effectiveFields.length) * 100);
 }
 
 function compactProfileValue(value: unknown) {
@@ -331,9 +399,16 @@ function asArray<T>(value: T[] | undefined | null): T[] {
 function profileLabelValue(profile: StudentProfile | undefined, key: keyof StudentProfile) {
   const labels: Record<keyof StudentProfile, string> = {
     province: "高考省份",
+    year: "年份",
     subjectTrack: "科类",
     score: "分数",
     rank: "位次",
+    targetCities: "目标城市",
+    preferredMajors: "专业偏好",
+    familyBudget: "预算",
+    riskPreference: "风险偏好",
+    acceptPrivate: "接受民办",
+    acceptSinoForeign: "接受中外合作",
     budget: "预算",
     cityPreference: "意向城市",
     canLeaveProvince: "出省",
@@ -364,8 +439,13 @@ const PROFILE_FIELDS: Array<{
   { key: "avoidMajors", label: "避雷", question: "我明确不想碰的专业方向是：" },
 ];
 
-function getMissingProfileFields(profile: StudentProfile | undefined) {
+function getMissingProfileFields(
+  profile: StudentProfile | undefined,
+  ignoredFields: Array<string | keyof StudentProfile> = [],
+) {
+  const ignored = new Set(normalizeIgnoredKeys(ignoredFields));
   return PROFILE_FIELDS.filter(({ key }) => {
+    if (ignored.has(key)) return false;
     const value = profile?.[key];
     return value === undefined || value === "" || (Array.isArray(value) && value.length === 0);
   });
@@ -393,12 +473,69 @@ const SUGGESTION_TEMPLATE_BY_FIELD: Partial<Record<keyof StudentProfile, string[
 
 const FALLBACK_SUGGESTIONS = ["我想冲 211", "帮我做稳妥方案", "不想出省", "想读计算机", "需要保研机会"];
 
+const FOLLOW_UP_OPTIONS_BY_FIELD: Partial<
+  Record<keyof StudentProfile, Array<{ label: string; prompt: string }>>
+> = {
+  province: [
+    { label: "我是天津考生", prompt: "我的高考省份是：天津" },
+    { label: "我是海南考生", prompt: "我的高考省份是：海南" },
+    { label: "我是河北考生", prompt: "我的高考省份是：河北" },
+  ],
+  subjectTrack: [
+    { label: "物理类", prompt: "我的科类/选科是：物理类" },
+    { label: "历史类", prompt: "我的科类/选科是：历史类" },
+    { label: "综合改革", prompt: "我的科类/选科是：综合改革" },
+  ],
+  score: [
+    { label: "补高考分数", prompt: "我的高考分数是：" },
+    { label: "这是模拟分", prompt: "这是我的模拟/预估分：" },
+  ],
+  rank: [
+    { label: "先用2025参考位次", prompt: "我暂时没有正式位次，请先用2025一分一段参考位次判断。" },
+    { label: "稍后补正式位次", prompt: "我稍后再补正式位次，当前先不要把位次作为硬性条件。" },
+  ],
+  budget: [
+    { label: "预算从严", prompt: "家里每年预算比较严格，优先公办和低学费。" },
+    { label: "可接受中外合作", prompt: "家里可接受中外合作，但要看学费和就业回报。" },
+    { label: "预算无上限", prompt: "预算暂时不是主要限制。" },
+  ],
+  cityPreference: [
+    { label: "留本省", prompt: "我更想留在本省读大学。" },
+    { label: "想去的城市/地区是：", prompt: "我想去的城市/地区是：" },
+    { label: "地区不限", prompt: "城市和地区无所谓，哪里都可以。" },
+  ],
+  canLeaveProvince: [
+    { label: "可以接受出省", prompt: "可以接受出省读大学。" },
+    { label: "不想出省", prompt: "不想出省，优先省内。" },
+    { label: "出省无所谓", prompt: "出省无所谓，哪里合适去哪里。" },
+  ],
+  graduatePlan: [
+    { label: "本科就业优先", prompt: "本科后倾向直接就业。" },
+    { label: "倾向读研/保研", prompt: "本科后倾向读研/保研。" },
+    { label: "还没想好", prompt: "本科后就业还是读研还没想好，请先按稳妥路径建议。" },
+  ],
+  majorPreference: [
+    { label: "计算机/软件", prompt: "我偏好的专业方向是：计算机、软件、人工智能。" },
+    { label: "电子/电气", prompt: "我偏好的专业方向是：电子信息、电气、自动化。" },
+    { label: "专业方向是：", prompt: "我偏好的专业方向是：" },
+  ],
+  avoidMajors: [
+    { label: "不想学医学", prompt: "我想避开的专业是：医学。" },
+    { label: "不想当老师", prompt: "我想避开的专业是：师范。" },
+    { label: "避雷专业是：", prompt: "我想避开的专业是：" },
+  ],
+};
+
 function getProfileValue(profile: StudentProfile, key: keyof StudentProfile, fallback = "待补") {
   const value = compactProfileValue(profile[key]);
   return value || fallback;
 }
 
-function buildStrategySummary(profile: StudentProfile, missingFields: Array<keyof StudentProfile>) {
+function buildStrategySummary(
+  profile: StudentProfile,
+  missingFields: Array<keyof StudentProfile>,
+  ignoredFields: Array<keyof StudentProfile> = [],
+) {
   const score = typeof profile.score === "number" ? profile.score : null;
   const hasRank = typeof profile.rank === "number" && profile.rank > 0;
   const risk = !hasRank || missingFields.includes("rank") ? "位次待补全" : "可进入精算";
@@ -407,11 +544,18 @@ function buildStrategySummary(profile: StudentProfile, missingFields: Array<keyo
     : "当前画像仍在收集中，";
   const blocker = missingFields.length
     ? `但缺少${missingFields.slice(0, 3).map((key) => PROFILE_FIELDS.find((field) => field.key === key)?.label ?? key).join("、")}等关键项，暂不能生成最终冲稳保方案。`
+    : ignoredFields.length
+    ? `已按你的选择忽略${ignoredFields.length}项待补信息，可以先基于已知画像生成初步意见。`
     : "关键画像已补齐，可以继续生成更精确的冲稳保方案。";
+  const nextStep = missingFields.length
+    ? "建议先补齐最前面的缺口，以获得更稳定的推荐结果。"
+    : ignoredFields.length
+    ? "后续如果补充城市、预算或专业偏好，我会再把方案精修。"
+    : "下一步可以直接生成冲稳保方案或查看目标学校分数线。";
 
   return {
     risk,
-    body: `${intro}${blocker}建议先补齐位次、专业偏好和城市/预算约束，以获得更稳定的推荐结果。`,
+    body: `${intro}${blocker}${nextStep}`,
   };
 }
 
@@ -452,7 +596,7 @@ function buildReportMarkdown({
 const DEFAULT_COMPREHENSIVE_PROVINCES = new Set(["北京", "天津", "上海", "浙江", "山东", "海南"]);
 
 function normalizeProvinceForProfile(province: string | undefined) {
-  return province?.trim().replace(/(省|市)$/, "") ?? "";
+  return normalizeProvinceForAgent(province);
 }
 
 function isDefaultComprehensiveProvince(province: string | undefined) {
@@ -460,20 +604,11 @@ function isDefaultComprehensiveProvince(province: string | undefined) {
 }
 
 function withDerivedProfile(profile: StudentProfile | undefined): StudentProfile {
-  const next = { ...(profile ?? {}) };
-  if (!next.subjectTrack && isDefaultComprehensiveProvince(next.province)) {
-    next.subjectTrack = "综合改革";
-  }
-  return next;
+  return withDerivedStudentProfile(profile as AgentStudentProfile | undefined) as StudentProfile;
 }
 
 function mergeProfile(base: StudentProfile | undefined, patch: Partial<StudentProfile> | undefined) {
-  return {
-    ...(base ?? {}),
-    ...(patch ?? {}),
-    majorPreference: patch?.majorPreference ?? base?.majorPreference,
-    avoidMajors: patch?.avoidMajors ?? base?.avoidMajors,
-  };
+  return mergeStudentProfile(base as AgentStudentProfile | undefined, patch as Partial<AgentStudentProfile> | undefined) as StudentProfile;
 }
 
 function normalizePriorityKeys(items: Array<string | keyof StudentProfile> | undefined) {
@@ -490,9 +625,10 @@ function prioritizeMissingFields(
   profile: StudentProfile | undefined,
   prompt = "",
   preferred: Array<string | keyof StudentProfile> = [],
+  ignoredFields: Array<string | keyof StudentProfile> = [],
 ) {
   const text = prompt.replace(/\s+/g, "");
-  const missingKeys = getMissingProfileFields(profile).map((field) => field.key);
+  const missingKeys = getMissingProfileFields(profile, ignoredFields).map((field) => field.key);
   const priority: Array<keyof StudentProfile> = [];
   const push = (key: keyof StudentProfile) => {
     if (missingKeys.includes(key) && !priority.includes(key)) priority.push(key);
@@ -519,9 +655,7 @@ function prioritizeMissingFields(
 }
 
 function buildKeyFacts(patch: Partial<StudentProfile>, prompt: string) {
-  const facts = PROFILE_FIELDS.map(({ key }) => profileLabelValue(patch as StudentProfile, key)).filter(Boolean);
-  if (/今年|高考|2026/.test(prompt)) facts.unshift("时间阶段：2026 高考后志愿准备期");
-  return uniqueTextItems(facts);
+  return buildProfileKeyFacts(patch as Partial<AgentStudentProfile>, prompt);
 }
 
 function compactSessionSummary(previousSummary: string, prompt: string, facts: string[]) {
@@ -546,23 +680,27 @@ function buildSuggestions(
   profile: StudentProfile | undefined,
   missingPriority: Array<keyof StudentProfile>,
   lastAssistantText = "",
+  ignoredFields: Array<string | keyof StudentProfile> = [],
 ) {
   const suggestions: string[] = [];
+  const ignored = new Set(normalizeIgnoredKeys(ignoredFields));
   const pushMany = (items: string[] | undefined) => {
     items?.forEach((item) => {
       if (item && !suggestions.includes(item)) suggestions.push(item);
     });
   };
 
-  missingPriority.forEach((key) => pushMany(SUGGESTION_TEMPLATE_BY_FIELD[key]));
+  missingPriority.forEach((key) => {
+    if (!ignored.has(key)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD[key]);
+  });
 
-  if (/位次|排名|排位/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.rank);
-  if (/预算|学费|生活费|中外合作|费用/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.budget);
-  if (/城市|地区|想去|哪里读|省份/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.cityPreference);
-  if (/出省|外省|省内/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.canLeaveProvince);
-  if (/读研|保研|就业/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.graduatePlan);
+  if (!ignored.has("rank") && /位次|排名|排位/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.rank);
+  if (!ignored.has("budget") && /预算|学费|生活费|中外合作|费用/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.budget);
+  if (!ignored.has("cityPreference") && /城市|地区|想去|哪里读|省份/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.cityPreference);
+  if (!ignored.has("canLeaveProvince") && /出省|外省|省内/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.canLeaveProvince);
+  if (!ignored.has("graduatePlan") && /读研|保研|就业/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.graduatePlan);
 
-  if (!profile?.rank && profile?.score) suggestions.unshift("我的位次是：");
+  if (!ignored.has("rank") && !profile?.rank && profile?.score) suggestions.unshift("我的位次是：");
   return uniqueTextItems(suggestions).slice(0, 8);
 }
 
@@ -577,9 +715,16 @@ function buildLocalTurnContext({
   previousSummary: string;
   lastAssistantText: string;
 }): TurnContext {
-  const profilePatch = extractProfileFromPrompt(prompt);
+  const initialToolRoute = routeAgentTurn({
+    userMessage: prompt,
+    profile: profile as AgentStudentProfile,
+  });
+  const profilePatch = initialToolRoute.profilePatch as Partial<StudentProfile>;
   const rawMergedProfile = mergeProfile(profile, profilePatch);
   const mergedProfile = withDerivedProfile(rawMergedProfile);
+  if (!mergedProfile.year && initialToolRoute.profileSnapshot.year) {
+    mergedProfile.year = initialToolRoute.profileSnapshot.year;
+  }
   const derivedSubjectTrack =
     !rawMergedProfile.subjectTrack && mergedProfile.subjectTrack ? mergedProfile.subjectTrack : undefined;
   const enrichedProfilePatch = derivedSubjectTrack
@@ -589,12 +734,18 @@ function buildLocalTurnContext({
   const keyFacts = buildKeyFacts(enrichedProfilePatch, prompt);
   const sessionSummary = compactSessionSummary(previousSummary, prompt, keyFacts);
   const suggestions = buildSuggestions(mergedProfile, missingPriority, lastAssistantText);
+  const toolRoute: RouterDecision = {
+    ...initialToolRoute,
+    profilePatch: enrichedProfilePatch as Partial<AgentStudentProfile>,
+    profileSnapshot: mergedProfile as AgentStudentProfile,
+  };
 
   return {
     rawPrompt: prompt,
     keyFacts,
     profilePatch: enrichedProfilePatch,
     profileAfterTurn: mergedProfile,
+    toolRoute,
     missingPriority,
     sessionSummary,
     suggestions,
@@ -667,7 +818,7 @@ async function requestRankHydration(profile: StudentProfile) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       province: profile.province,
-      year: 2025,
+      year: profile.year ?? DEFAULT_RANK_REFERENCE_YEAR,
       subjectTrack: normalizeRankHydrationSubject(profile),
       score: profile.score,
     }),
@@ -684,6 +835,7 @@ function mergeRankHydrationIntoTurnContext(
 ) {
   const rankPatch: Partial<StudentProfile> = {
     rank: rankResult.rank,
+    year: rankResult.year ?? turnContext.profileAfterTurn.year ?? DEFAULT_RANK_REFERENCE_YEAR,
     subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
     updatedAt: new Date().toISOString(),
   };
@@ -696,6 +848,10 @@ function mergeRankHydrationIntoTurnContext(
     turnContext.missingPriority.filter((key) => key !== "rank"),
   );
   const suggestions = buildSuggestions(profileAfterTurn, missingPriority, lastAssistantText);
+  const toolRoute = routeAgentTurn({
+    userMessage: turnContext.rawPrompt,
+    profile: profileAfterTurn as AgentStudentProfile,
+  });
   const warnings =
     rankResult.matchedScore !== profileAfterTurn.score
       ? [`一分一段未精确命中 ${profileAfterTurn.score} 分，已按不高于该分数的 ${rankResult.matchedScore} 分匹配。`]
@@ -706,6 +862,7 @@ function mergeRankHydrationIntoTurnContext(
     keyFacts: uniqueTextItems([...turnContext.keyFacts, ...rankFacts]),
     profilePatch,
     profileAfterTurn,
+    toolRoute,
     missingPriority,
     sessionSummary: compactSessionSummary(turnContext.sessionSummary, "", rankFacts),
     suggestions,
@@ -723,6 +880,13 @@ function mergeRemoteTurnContext(
   const profilePatch = mergeProfile(localTurn.profilePatch as StudentProfile, remotePatch);
   const rawMergedProfile = mergeProfile(baseProfile, profilePatch);
   const mergedProfile = withDerivedProfile(rawMergedProfile);
+  const remoteToolRouteSeed = routeAgentTurn({
+    userMessage: localTurn.rawPrompt,
+    profile: mergedProfile as AgentStudentProfile,
+  });
+  if (!mergedProfile.year && remoteToolRouteSeed.profileSnapshot.year) {
+    mergedProfile.year = remoteToolRouteSeed.profileSnapshot.year;
+  }
   const derivedSubjectTrack =
     !rawMergedProfile.subjectTrack && mergedProfile.subjectTrack ? mergedProfile.subjectTrack : undefined;
   const enrichedProfilePatch = derivedSubjectTrack
@@ -734,12 +898,17 @@ function mergeRemoteTurnContext(
     remote.missingPriority,
   );
   const suggestions = uniqueTextItems([...(remote.suggestions ?? []), ...localTurn.suggestions]).slice(0, 8);
+  const toolRoute = routeAgentTurn({
+    userMessage: localTurn.rawPrompt,
+    profile: mergedProfile as AgentStudentProfile,
+  });
 
   return {
     ...localTurn,
     keyFacts: uniqueTextItems([...(remote.keyFacts ?? []), ...localTurn.keyFacts]),
     profilePatch: enrichedProfilePatch,
     profileAfterTurn: mergedProfile,
+    toolRoute,
     missingPriority,
     sessionSummary: remote.sessionSummary?.trim() || localTurn.sessionSummary,
     suggestions: suggestions.length ? suggestions : localTurn.suggestions,
@@ -812,63 +981,7 @@ function hasExamProvinceContext(text: string, candidate: string) {
 }
 
 function extractProfileFromPrompt(prompt: string): Partial<StudentProfile> {
-  const text = prompt.replace(/\s+/g, "");
-  const lower = prompt.toLowerCase();
-  const patch: Partial<StudentProfile> = {};
-  const mentionedProvinces = PROVINCE_CANDIDATES.filter((item) => text.includes(item));
-  const destinationProvinces = mentionedProvinces.filter((item) => hasDestinationContext(text, item));
-  const examProvince = mentionedProvinces.find((item) => hasExamProvinceContext(text, item));
-  if (examProvince) patch.province = examProvince;
-
-  if (/物理|理科|physics/.test(lower)) patch.subjectTrack = /理科/.test(text) ? "理科" : "物理类";
-  if (/历史|文科|history/.test(lower)) patch.subjectTrack = /文科/.test(text) ? "文科" : "历史类";
-
-  const scoreMatch = text.match(/(?:^|[^\d])(\d{3})(?:分|$|[^\d])/);
-  if (scoreMatch) patch.score = Number(scoreMatch[1]);
-
-  const rankMatch = text.match(/(?:位次|排名|排位|名次)[约大概]?(\d{3,7})|(\d{3,7})(?:名|位)/);
-  const rankValue = rankMatch?.[1] ?? rankMatch?.[2];
-  if (rankValue) patch.rank = Number(rankValue);
-
-  if (/普通家庭|家里普通|工薪|预算有限|农村|县城/.test(text)) patch.familyType = "普通家庭";
-  if (/预算|学费|生活费|中外|合作|钱/.test(text)) {
-    const budgetMatch = prompt.match(/(?:预算|学费|生活费|一年|每年)[^，。,.!?？]{0,16}/);
-    patch.budget = budgetMatch?.[0]?.trim() || "需控制成本";
-  }
-  if (/不出省|不想出省|留本省|留省内/.test(text)) patch.canLeaveProvince = false;
-  if (/可出省|能出省|接受出省|外省/.test(text)) patch.canLeaveProvince = true;
-  if (/出省(?:无所谓|都行|不限|不限制)|(?:无所谓|都行|不限|不限制)出省|哪里都行|去哪都行/.test(text)) {
-    patch.canLeaveProvince = true;
-  }
-  if (/城市(?:无所谓|都行|不限|不限制)|地区(?:无所谓|都行|不限|不限制)|(?:无所谓|都行|不限|不限制)(?:城市|地区)|哪里都行|去哪都行/.test(text)) {
-    patch.cityPreference = "不限地区";
-  }
-
-  const citySignals = uniqueTextItems(
-    [
-      ...destinationProvinces,
-      ...["南京", "苏州", "无锡", "上海", "杭州", "北京", "天津", "广州", "深圳", "武汉", "成都", "西安", "省会", "长三角", "珠三角", "北上广深"].filter(
-        (item) => text.includes(item) && (hasDestinationContext(text, item) || /城市|地区|想去|留在|目标|偏好/.test(text)),
-      ),
-    ],
-  );
-  if (citySignals.length) patch.cityPreference = citySignals.join("、");
-
-  if (/考研|读研|保研|研究生/.test(text)) patch.graduatePlan = "倾向读研/保研";
-  if (/就业|本科毕业工作|直接工作/.test(text)) patch.graduatePlan = "本科就业优先";
-
-  const majorPreference = uniqueTextItems(
-    ["计算机", "软件", "电子", "电气", "自动化", "通信", "机械", "医学", "师范", "法学", "会计", "金融", "数学", "统计", "人工智能"].filter(
-      (item) => text.includes(item) && !new RegExp(`不想|别碰|避开|不喜欢`).test(text),
-    ),
-  );
-  if (majorPreference.length) patch.majorPreference = majorPreference;
-
-  const avoidMatches = prompt.match(/(?:避开|别碰|不想学|不喜欢|不报)([^。！？!?，,]{2,30})/g);
-  if (avoidMatches?.length) patch.avoidMajors = uniqueTextItems(avoidMatches.map((item) => item.replace(/^(避开|别碰|不想学|不喜欢|不报)/, "")));
-
-  if (Object.keys(patch).length > 0) patch.updatedAt = new Date().toISOString();
-  return patch;
+  return extractStudentProfilePatch(prompt) as Partial<StudentProfile>;
 }
 
 function isOfficialAdmissionSource(source: {
@@ -1305,6 +1418,87 @@ function StudentProfileSummary({ profile, missingFields = [], nextQuestions = []
   );
 }
 
+function FollowUpQuestionOptions({
+  questions = [],
+  onSelect,
+  onDeselect,
+}: FollowUpQuestionOptionsArgs & {
+  onSelect: (prompt: string) => void;
+  onDeselect: (prompt: string) => void;
+}) {
+  const markerRef = useRef<HTMLSpanElement | null>(null);
+  const instanceIdRef = useRef(`followup-${Math.random().toString(36).slice(2)}`);
+
+  useEffect(() => {
+    const marker = markerRef.current;
+    if (!marker) return;
+    const visibleQuestions = dedupeFollowUpQuestions(questions).slice(0, 5);
+    if (!visibleQuestions.length) return;
+
+    const assistantMessages = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage'),
+    );
+    const parent =
+      marker.closest<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage') ??
+      assistantMessages.at(-1) ??
+      marker.parentElement;
+    if (!parent) return;
+    assistantMessages.slice(0, -1).forEach((message) => {
+      message.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+    });
+
+    parent.querySelectorAll(`[data-followup-instance="${instanceIdRef.current}"]`).forEach((node) => node.remove());
+
+    const container = document.createElement("div");
+    container.className = "gaokao-followup-options my-3 grid gap-3";
+    container.dataset.followupInstance = instanceIdRef.current;
+
+    visibleQuestions.forEach((question, index) => {
+      const group = document.createElement("div");
+      group.className = "rounded-2xl border border-blue-100 bg-white px-3 py-3 shadow-sm";
+
+      const label = document.createElement("p");
+      label.className = "text-sm font-black leading-6 text-slate-900";
+      label.textContent = question.question;
+      group.append(label);
+
+      const row = document.createElement("div");
+      row.className = "mt-2 flex gap-2 overflow-x-auto pb-1";
+
+      question.options.slice(0, 6).forEach((option) => {
+        const prompt = option.prompt?.trim() || option.value?.trim() || option.label;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700 active:scale-[0.98]";
+        button.textContent = option.label;
+        button.addEventListener("click", () => {
+          const selected = button.dataset.selected === "true";
+          if (selected) {
+            button.dataset.selected = "false";
+            button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700 active:scale-[0.98]";
+            onDeselect(prompt);
+            return;
+          }
+          button.dataset.selected = "true";
+          button.className = "shrink-0 rounded-xl border border-blue-600 bg-blue-600 px-3.5 py-2 text-sm font-black text-white shadow-sm active:scale-[0.98]";
+          onSelect(prompt);
+        });
+        row.append(button);
+      });
+
+      group.dataset.followupField = String(normalizeFollowUpField(question.field, question.question));
+      group.dataset.followupOrder = String(index);
+      group.append(row);
+      container.append(group);
+    });
+
+    parent.append(container);
+    return undefined;
+  }, [onDeselect, onSelect, questions]);
+
+  return <span ref={markerRef} className="gaokao-followup-options-marker hidden" />;
+}
+
 function VolunteerPlanCards({ profile, tiers, warnings = [], sources = [] }: VolunteerPlanCardsArgs) {
   const safeTiers = asArray(tiers).map((tier) => ({
     ...tier,
@@ -1518,7 +1712,26 @@ function GenericComparisonCard({
   sources?: Array<{ id: string; title: string; url?: string; publisher?: string; kind?: string }>;
   warnings?: Array<string>;
 }) {
-  const safeItems = Array.isArray(items) ? items : [];
+  const clampText = (value: string, max = 110) => {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+  };
+  const safeItems = (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const dimensions = asArray(item?.dimensions)
+        .map((dim) => ({
+          label: clampText(String(dim?.label ?? ""), 10),
+          value: clampText(String(dim?.value ?? ""), 110),
+        }))
+        .filter((dim) => dim.label && dim.value);
+      return {
+        ...item,
+        name: clampText(String(item?.name ?? ""), 24),
+        verdict: clampText(String(item?.verdict ?? ""), 110),
+        dimensions,
+      };
+    })
+    .filter((item) => item.name && (item.dimensions.length > 0 || item.verdict));
   const safeSources = Array.isArray(sources) ? sources : [];
   const safeWarnings = Array.isArray(warnings) ? warnings : [];
 
@@ -1540,15 +1753,15 @@ function GenericComparisonCard({
   };
 
   return (
-    <div className="my-3 rounded-lg border border-blue-100 bg-white p-3 text-zinc-950 shadow-sm">
+    <div className="gaokao-generic-comparison-card my-3 rounded-lg border border-blue-100 bg-white p-3 text-zinc-950 shadow-sm">
       <p className="text-xs font-semibold text-blue-700">对比分析</p>
       <h3 className="mt-1 text-base font-semibold">{title}</h3>
       
       {/* 对比项卡片网格 */}
       <div className="mt-3 grid gap-3">
         {safeItems.length ? (
-          safeItems.map((item) => (
-            <article key={item.name} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
+          safeItems.map((item, itemIndex) => (
+            <article key={`${item.name}-${itemIndex}`} className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
               {/* 标题栏 */}
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
@@ -1560,14 +1773,16 @@ function GenericComparisonCard({
               </div>
               
               {/* 对比维度列表 */}
-              <div className="mt-2 grid gap-1.5 text-xs leading-5 text-zinc-700">
-                {Array.isArray(item.dimensions) && item.dimensions.map((dim, idx) => (
-                  <div key={idx} className="flex gap-2">
-                    <span className="shrink-0 font-medium text-zinc-600">{processMarkdown(dim.label)}：</span>
-                    <span className="flex-1">{processMarkdown(dim.value)}</span>
-                  </div>
-                ))}
-              </div>
+              {item.dimensions.length ? (
+                <div className="mt-2 grid gap-1.5 text-xs leading-5 text-zinc-700">
+                  {item.dimensions.map((dim, idx) => (
+                    <div key={idx} className="grid grid-cols-[70px_1fr] gap-2">
+                      <span className="font-medium text-zinc-600">{processMarkdown(dim.label)}：</span>
+                      <span className="min-w-0 break-words">{processMarkdown(dim.value)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               
               {/* 总结性判断 */}
               {item.verdict ? (
@@ -2095,6 +2310,77 @@ function useSessionInsights(activeSessionId: string) {
   };
 }
 
+function useSessionUiState(activeSessionId: string) {
+  const [hydrated, setHydrated] = useState(false);
+  const [ignoredBySession, setIgnoredBySession] = useState<Record<string, Array<keyof StudentProfile>>>({});
+  const [collapsedBySession, setCollapsedBySession] = useState<Record<string, boolean>>({});
+  const [rankMetaBySession, setRankMetaBySession] = useState<Record<string, RankMeta>>({});
+
+  useEffect(() => {
+    try {
+      const storedIgnored = localStorage.getItem(IGNORED_MISSING_STORAGE_KEY);
+      const storedCollapsed = localStorage.getItem(PROFILE_PANEL_COLLAPSED_STORAGE_KEY);
+      const storedRankMeta = localStorage.getItem(RANK_META_STORAGE_KEY);
+      setIgnoredBySession(storedIgnored ? JSON.parse(storedIgnored) : {});
+      setCollapsedBySession(storedCollapsed ? JSON.parse(storedCollapsed) : {});
+      setRankMetaBySession(storedRankMeta ? JSON.parse(storedRankMeta) : {});
+    } catch {
+      setIgnoredBySession({});
+      setCollapsedBySession({});
+      setRankMetaBySession({});
+    } finally {
+      setHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(IGNORED_MISSING_STORAGE_KEY, JSON.stringify(ignoredBySession));
+    localStorage.setItem(PROFILE_PANEL_COLLAPSED_STORAGE_KEY, JSON.stringify(collapsedBySession));
+    localStorage.setItem(RANK_META_STORAGE_KEY, JSON.stringify(rankMetaBySession));
+  }, [collapsedBySession, hydrated, ignoredBySession, rankMetaBySession]);
+
+  const setIgnoredFields = useCallback((sessionId: string, fields: Array<string | keyof StudentProfile>) => {
+    const normalized = normalizeIgnoredKeys(fields);
+    setIgnoredBySession((current) => ({ ...current, [sessionId]: normalized }));
+  }, []);
+
+  const clearIgnoredFields = useCallback((sessionId: string) => {
+    setIgnoredBySession((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  const setProfilePanelCollapsed = useCallback((sessionId: string, collapsed: boolean) => {
+    setCollapsedBySession((current) => ({ ...current, [sessionId]: collapsed }));
+  }, []);
+
+  const upsertRankMeta = useCallback((sessionId: string, meta: RankMeta) => {
+    setRankMetaBySession((current) => ({ ...current, [sessionId]: meta }));
+  }, []);
+
+  const clearRankMeta = useCallback((sessionId: string) => {
+    setRankMetaBySession((current) => {
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  return {
+    activeIgnoredFields: ignoredBySession[activeSessionId] ?? [],
+    activeProfilePanelCollapsed: collapsedBySession[activeSessionId] ?? false,
+    activeRankMeta: rankMetaBySession[activeSessionId],
+    clearIgnoredFields,
+    clearRankMeta,
+    setIgnoredFields,
+    setProfilePanelCollapsed,
+    upsertRankMeta,
+  };
+}
+
 function useMobileVisualViewport() {
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -2174,11 +2460,13 @@ function useAssistantSuggestionRefresh({
   activeSessionId,
   profile,
   missingPriority,
+  ignoredFields = [],
   upsertSuggestions,
 }: {
   activeSessionId: string;
   profile: StudentProfile;
   missingPriority?: Array<keyof StudentProfile>;
+  ignoredFields?: Array<keyof StudentProfile>;
   upsertSuggestions: (sessionId: string, suggestions: string[]) => void;
 }) {
   useEffect(() => {
@@ -2192,39 +2480,243 @@ function useAssistantSuggestionRefresh({
         const latestAssistantText = readLastAssistantText();
         if (!latestAssistantText || latestAssistantText === lastText) return;
         lastText = latestAssistantText;
-        const nextMissing = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
-        const nextSuggestions = buildSuggestions(profile, nextMissing, latestAssistantText);
+        const nextMissing = prioritizeMissingFields(profile, "", missingPriority, ignoredFields).slice(0, 8);
+        const nextSuggestions = buildSuggestions(profile, nextMissing, latestAssistantText, ignoredFields);
         if (nextSuggestions.length) upsertSuggestions(activeSessionId, nextSuggestions);
-      }, 350);
+      }, 900);
     };
 
     refreshSuggestions();
     const observer = new MutationObserver(refreshSuggestions);
-    observer.observe(document.body, {
+    const messageList = document.querySelector('[data-testid="copilot-message-list"]') ?? document.body;
+    observer.observe(messageList, {
       childList: true,
       subtree: true,
-      characterData: true,
     });
 
     return () => {
       window.clearTimeout(timer);
       observer.disconnect();
     };
-  }, [activeSessionId, missingPriority, profile, upsertSuggestions]);
+  }, [activeSessionId, ignoredFields, missingPriority, profile, upsertSuggestions]);
+}
+
+function buildInlineFollowUpQuestions(
+  text: string,
+  profile: StudentProfile,
+  ignoredFields: Array<keyof StudentProfile>,
+) {
+  const asksForMore =
+    /需要(?:告诉|补充|确认|说)|请(?:补充|告诉|确认)|能接受.*吗|能不能|有没有|更倾向|还是|方向(?:是|吗)|城市.*(?:是|吗)|预算.*多少|位次.*吗|吗[？?]|[？?]/.test(text);
+  if (!asksForMore) return [];
+
+  void profile;
+  void ignoredFields;
+  const questions: Array<{ field: keyof StudentProfile; question: string }> = [];
+  const push = (field: keyof StudentProfile, question: string) => {
+    if (questions.some((item) => item.field === field)) return;
+    questions.push({ field, question });
+  };
+
+  if (/位次|排名|排位|全省/.test(text)) push("rank", "你的全省位次查到了吗？");
+  if (/预算|学费|生活费|中外合作|费用/.test(text)) push("budget", "家里每年预算大概能接受多少？");
+  if (/城市|地区|想去|哪里读|留在/.test(text)) push("cityPreference", "你更想去哪个城市或地区？");
+  if (/出省|外省|省内/.test(text)) push("canLeaveProvince", "能接受出省读大学吗？");
+  if (/专升本|升本|读研|保研|就业|本科毕业|毕业后/.test(text)) push("graduatePlan", "毕业后更倾向直接就业、升学，还是还不确定？");
+  if (/专业|方向|计算机|电气|机械|医学|师范/.test(text)) push("majorPreference", "专业方向能再具体一点吗？");
+
+  return dedupeFollowUpQuestions(questions.map((question) => ({
+    ...question,
+    options: question.field === "graduatePlan" && /专升本|升本/.test(text)
+      ? [
+          { label: "直接就业", prompt: "毕业后倾向直接就业。" },
+          { label: "想专升本", prompt: "毕业后想专升本。" },
+          { label: "还没想好", prompt: "毕业后就业还是专升本还没想好。" },
+        ]
+      : FOLLOW_UP_OPTIONS_BY_FIELD[question.field] ?? [],
+  }))).slice(0, 4);
+}
+
+function normalizeFollowUpField(field: string | undefined, question = "") {
+  const value = `${field ?? ""} ${question}`.replace(/\s+/g, "");
+  const mapped = FIELD_BY_LABEL.get(field ?? "");
+  if (mapped) return mapped;
+  if (/rank|位次|排名|排位|全省/.test(value)) return "rank";
+  if (/budget|预算|学费|生活费|中外|费用|钱/.test(value)) return "budget";
+  if (/city|城市|地区|想去|哪里读|留在|京津冀|长三角/.test(value)) return "cityPreference";
+  if (/leave|出省|外省|省内/.test(value)) return "canLeaveProvince";
+  if (/graduate|读研|保研|就业|本科毕业|专升本|升本/.test(value)) return "graduatePlan";
+  if (/majorPreference|专业偏好|专业方向|选科组合|选科|物理|化学/.test(value)) return "majorPreference";
+  if (/avoid|避雷|避开|不想学|别碰/.test(value)) return "avoidMajors";
+  if (/subject|科类|文科|理科|历史|综合改革/.test(value)) return "subjectTrack";
+  if (/province|高考省份|考生|生源/.test(value)) return "province";
+  if (/score|分数|成绩/.test(value)) return "score";
+  return value || question;
+}
+
+function dedupeFollowUpQuestions(questions: FollowUpQuestionOptionsArgs["questions"]) {
+  const seen = new Set<string>();
+  return questions.filter((question) => {
+    if (!question.question?.trim() || !question.options?.length) return false;
+    const key = String(normalizeFollowUpField(question.field, question.question));
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function useInlineFollowUpOptions({
+  activeSessionId,
+  profile,
+  ignoredFields,
+  onSelect,
+  onDeselect,
+}: {
+  activeSessionId: string;
+  profile: StudentProfile;
+  ignoredFields: Array<keyof StudentProfile>;
+  onSelect: (prompt: string) => void;
+  onDeselect: (prompt: string) => void;
+}) {
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+
+    let frame = 0;
+    const timers = new Set<number>();
+    const clearTimers = () => {
+      timers.forEach((timerId) => window.clearTimeout(timerId));
+      timers.clear();
+    };
+    const enhance = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const messages = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage'));
+        const latestMessage = messages.at(-1);
+        messages.slice(0, -1).forEach((message) => {
+          message.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+        });
+        if (!latestMessage) return;
+        const existingFollowUps = Array.from(
+          latestMessage.querySelectorAll<HTMLElement>(".gaokao-followup-options"),
+        );
+        if (existingFollowUps.length) {
+          existingFollowUps.forEach((node) => latestMessage.append(node));
+          return;
+        }
+        if (latestMessage.querySelector('[data-gaokao-running="true"]')) return;
+        const text = latestMessage.innerText.trim();
+        const questions = buildInlineFollowUpQuestions(text, profile, ignoredFields);
+        if (!questions.length) return;
+
+        latestMessage.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+        const container = document.createElement("div");
+        container.className = "gaokao-inline-followup-options mt-3 grid gap-2";
+        container.dataset.gaokaoInlineFollowup = "true";
+        questions.forEach((question) => {
+          const group = document.createElement("div");
+          group.className = "rounded-2xl border border-blue-100 bg-white px-3 py-3 shadow-sm";
+
+          const label = document.createElement("p");
+          label.className = "text-sm font-black leading-6 text-slate-900";
+          label.textContent = question.question;
+          group.append(label);
+
+          const buttonRow = document.createElement("div");
+          buttonRow.className = "mt-2 flex gap-2 overflow-x-auto pb-1";
+          question.options.slice(0, 5).forEach((option) => {
+            const prompt = option.prompt?.trim() || option.label;
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700";
+            button.textContent = option.label;
+            button.addEventListener("click", () => {
+              if (button.dataset.selected === "true") {
+                button.dataset.selected = "false";
+                button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700";
+                onDeselect(prompt);
+                return;
+              }
+              button.dataset.selected = "true";
+              button.className = "shrink-0 rounded-xl border border-blue-600 bg-blue-600 px-3.5 py-2 text-sm font-black text-white shadow-sm";
+              onSelect(prompt);
+            });
+            buttonRow.append(button);
+          });
+          group.append(buttonRow);
+          container.append(group);
+        });
+
+        latestMessage.append(container);
+      });
+    };
+    const scheduleEnhance = () => {
+      clearTimers();
+      [250, 1100, 2200].forEach((delay) => {
+        const timerId = window.setTimeout(enhance, delay);
+        timers.add(timerId);
+      });
+    };
+
+    scheduleEnhance();
+    const observer = new MutationObserver(scheduleEnhance);
+    const messageList = document.querySelector('[data-testid="copilot-message-list"]') ?? document.body;
+    observer.observe(messageList, { childList: true, subtree: true, characterData: true });
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      clearTimers();
+      observer.disconnect();
+    };
+  }, [activeSessionId, ignoredFields, onDeselect, onSelect, profile]);
 }
 
 function syncHiddenCopilotPrompt(message: string, focusHidden = false) {
   const textarea = document.querySelector<HTMLTextAreaElement>(COPILOT_CHAT_TEXTAREA_SELECTOR);
   if (textarea) {
+    const previousValue = textarea.value;
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
     setter?.call(textarea, message);
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    const valueTracker = (textarea as HTMLTextAreaElement & { _valueTracker?: { setValue: (value: string) => void } })
+      ._valueTracker;
+    valueTracker?.setValue(previousValue);
     if (focusHidden) textarea.focus();
+    textarea.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        data: message,
+        inputType: "insertText",
+      }),
+    );
+    textarea.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        data: message,
+        inputType: "insertText",
+      }),
+    );
+    textarea.dispatchEvent(new Event("change", { bubbles: true }));
   }
 }
 
 function insertPrompt(message: string) {
   window.dispatchEvent(new CustomEvent(COMPOSER_DRAFT_EVENT, { detail: message }));
+}
+
+function appendPromptToComposer(message: string) {
+  window.dispatchEvent(
+    new CustomEvent(COMPOSER_DRAFT_EVENT, {
+      detail: { mode: "append", value: message },
+    }),
+  );
+}
+
+function removePromptFromComposer(message: string) {
+  window.dispatchEvent(
+    new CustomEvent(COMPOSER_DRAFT_EVENT, {
+      detail: { mode: "remove", value: message },
+    }),
+  );
 }
 
 function buildSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
@@ -2241,22 +2733,40 @@ function submitSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
 }
 
 function submitHiddenCopilotPrompt(message: string) {
-  syncHiddenCopilotPrompt(message, false);
+  syncHiddenCopilotPrompt(message, true);
   let attempts = 0;
   const trySend = () => {
     const { sendButton, textarea } = getCopilotChatInputElements();
     if (!sendButton || !textarea || !textarea.value.trim()) {
-      if (attempts++ < 10) window.setTimeout(trySend, 50);
+      if (attempts++ < 20) {
+        syncHiddenCopilotPrompt(message, true);
+        window.setTimeout(trySend, 60);
+      }
       return;
     }
     if (sendButton.disabled) {
-      if (attempts++ < 10) window.setTimeout(trySend, 50);
+      if (attempts++ < 20) {
+        syncHiddenCopilotPrompt(message, true);
+        window.setTimeout(trySend, 60);
+      }
       return;
     }
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    syncHiddenCopilotPrompt(message, true);
     sendButton.click();
   };
   window.setTimeout(trySend, 50);
+}
+
+async function waitForRuntimeAgent(
+  copilotkit: ReturnType<typeof useCopilotKit>["copilotkit"],
+  fallbackAgent: ReturnType<typeof useAgent>["agent"],
+) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const runtimeAgent = copilotkit.getAgent("default");
+    if (runtimeAgent) return runtimeAgent;
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+  }
+  return fallbackAgent;
 }
 
 function getCopilotChatInputElements() {
@@ -2489,17 +2999,63 @@ function CandidateProfileCard({
   profile,
   completion,
   missingCount,
+  missingFields,
+  ignoredCount,
+  isCollapsed,
+  rankMeta,
   strategySummary,
-  missingPriority = [],
+  onToggleCollapsed,
   onIgnoreMissing,
+  onRestoreMissing,
 }: {
   profile: StudentProfile;
   completion: number;
   missingCount: number;
+  missingFields: Array<keyof StudentProfile>;
+  ignoredCount: number;
+  isCollapsed: boolean;
+  rankMeta?: RankMeta;
   strategySummary: ReturnType<typeof buildStrategySummary>;
-  missingPriority?: Array<keyof StudentProfile>;
+  onToggleCollapsed: () => void;
   onIgnoreMissing: () => void;
+  onRestoreMissing: () => void;
 }) {
+  const rankValue = formatRank(profile.rank);
+  const rankLabel = profile.rank
+    ? rankMeta?.source === "auto2025"
+      ? `2025参考：${rankValue}`
+      : `位次：${rankValue}`
+    : "位次待补";
+
+  if (isCollapsed) {
+    return (
+      <section className="mx-4 rounded-[22px] border border-blue-100 bg-white px-4 py-3 shadow-[0_14px_32px_rgba(15,23,42,0.07)]">
+        <div className="flex items-center gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline gap-2">
+              <span className="text-3xl font-black leading-none text-blue-600">{formatScore(profile.score)}</span>
+              <span className="text-xs font-black text-slate-500">分</span>
+              <span className="truncate text-sm font-bold text-slate-700">{rankLabel}</span>
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <span className="text-xs font-bold text-slate-500">完整度 {completion}%</span>
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
+                <div className="h-full rounded-full bg-blue-600" style={{ width: `${completion}%` }} />
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            className="h-10 shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3 text-xs font-black text-blue-700"
+          >
+            展开画像
+          </button>
+        </div>
+      </section>
+    );
+  }
+
   const chips = [
     { icon: MapPinIcon, label: "省份", value: getProfileValue(profile, "province") },
     { icon: BookOpenIcon, label: "科类", value: getProfileValue(profile, "subjectTrack") },
@@ -2508,7 +3064,6 @@ function CandidateProfileCard({
     { icon: BuildingLibraryIcon, label: "意向城市", value: getProfileValue(profile, "cityPreference") },
     { icon: CheckBadgeIcon, label: "当前状态", value: missingCount ? "待补全关键信息" : "可生成方案", danger: missingCount > 0 },
   ];
-  const missingFields = prioritizeMissingFields(profile, "", missingPriority).slice(0, 8);
   const missingByKey = new Map(PROFILE_FIELDS.map((field) => [field.key, field]));
   const icons: Partial<Record<keyof StudentProfile, typeof BookOpenIcon>> = {
     rank: TrophyIcon,
@@ -2535,7 +3090,16 @@ function CandidateProfileCard({
           <h2 className="text-[19px] font-black text-slate-950">考生画像</h2>
           <ShieldCheckIcon className="h-5 w-5 text-blue-600" />
         </div>
-        <PanelAgentBadge label="画像子 agent" />
+        <div className="flex items-center gap-2">
+          <PanelAgentBadge label="画像子 agent" />
+          <button
+            type="button"
+            onClick={onToggleCollapsed}
+            className="rounded-xl border border-blue-100 bg-blue-50 px-2.5 py-1.5 text-xs font-black text-blue-700"
+          >
+            折叠
+          </button>
+        </div>
       </div>
       <div className="mt-3 flex items-center gap-3">
         <span className="text-sm font-semibold text-slate-500">信息完整度</span>
@@ -2556,11 +3120,13 @@ function CandidateProfileCard({
           <span className="rounded-xl bg-blue-50 px-3 py-1.5 text-sm font-black text-blue-700">
             {getProfileValue(profile, "province", "省份待补")}考生
           </span>
-          {missingCount ? (
-            <span className="rounded-xl bg-red-50 px-3 py-1.5 text-sm font-black text-red-600">
-              位次待补全
-            </span>
-          ) : null}
+          <span
+            className={`rounded-xl px-3 py-1.5 text-sm font-black ${
+              profile.rank ? "bg-blue-50 text-blue-700" : "bg-red-50 text-red-600"
+            }`}
+          >
+            {rankLabel}
+          </span>
         </div>
       </div>
       <div className="mt-4 grid grid-cols-2 gap-x-3 gap-y-3 rounded-2xl border border-blue-50 bg-white/80 p-3">
@@ -2582,7 +3148,9 @@ function CandidateProfileCard({
       <div className="mt-4 border-t border-blue-50 pt-3">
         <div className="mb-2 flex items-center justify-between gap-2">
           <p className="text-sm font-black text-slate-950">待补信息</p>
-          <span className="text-xs font-black text-blue-700">{missingFields.length} 项待补充</span>
+          <span className="text-xs font-black text-blue-700">
+            {missingFields.length ? `${missingFields.length} 项待补充` : ignoredCount ? `已忽略 ${ignoredCount} 项` : "关键项已补齐"}
+          </span>
         </div>
         <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
           {missingFields.length ? (
@@ -2608,7 +3176,7 @@ function CandidateProfileCard({
             })
           ) : (
             <span className="h-9 shrink-0 rounded-xl bg-emerald-50 px-3.5 py-2.5 text-xs font-bold leading-none text-emerald-700">
-              关键画像已补齐
+              {ignoredCount ? "待补信息已忽略，按已知画像分析" : "关键画像已补齐"}
             </span>
           )}
         </div>
@@ -2636,13 +3204,26 @@ function CandidateProfileCard({
             );
           })}
         </div>
-        <button
-          type="button"
-          onClick={onIgnoreMissing}
-          className="mt-3 flex h-11 w-full items-center justify-center rounded-xl border border-slate-200 bg-slate-950 px-3 text-sm font-black text-white shadow-sm"
-        >
-          忽略待补信息，直接给意见摘要
-        </button>
+        <div className="mt-3 grid gap-2">
+          {missingFields.length ? (
+            <button
+              type="button"
+              onClick={onIgnoreMissing}
+              className="flex h-11 w-full items-center justify-center rounded-xl border border-slate-200 bg-slate-950 px-3 text-sm font-black text-white shadow-sm"
+            >
+              忽略待补信息，直接给意见摘要
+            </button>
+          ) : null}
+          {ignoredCount ? (
+            <button
+              type="button"
+              onClick={onRestoreMissing}
+              className="flex h-10 w-full items-center justify-center rounded-xl border border-blue-100 bg-blue-50 px-3 text-sm font-black text-blue-700"
+            >
+              恢复待补信息
+            </button>
+          ) : null}
+        </div>
       </div>
     </section>
   );
@@ -2764,8 +3345,38 @@ function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) 
 
   useEffect(() => {
     const handleDraft = (event: Event) => {
-      const customEvent = event as CustomEvent<string>;
-      setDraft(customEvent.detail ?? "");
+      const customEvent = event as CustomEvent<string | { mode?: string; value?: string }>;
+      const detail = customEvent.detail;
+      if (typeof detail === "object" && detail?.mode === "append") {
+        const value = detail.value?.trim();
+        if (!value) return;
+        setDraft((current) => {
+          const existing = current.trim();
+          const parts = existing.split("；").map((item) => item.trim()).filter(Boolean);
+          if (parts.includes(value)) return current;
+          const next = existing ? `${existing}；${value}` : value;
+          syncHiddenCopilotPrompt(next);
+          return next;
+        });
+        textareaRef.current?.focus({ preventScroll: true });
+        return;
+      }
+      if (typeof detail === "object" && detail?.mode === "remove") {
+        const value = detail.value?.trim();
+        if (!value) return;
+        setDraft((current) => {
+          const next = current
+            .split("；")
+            .map((item) => item.trim())
+            .filter((item) => item && item !== value)
+            .join("；");
+          syncHiddenCopilotPrompt(next);
+          return next;
+        });
+        textareaRef.current?.focus({ preventScroll: true });
+        return;
+      }
+      setDraft(typeof detail === "string" ? detail : "");
     };
     window.addEventListener(COMPOSER_DRAFT_EVENT, handleDraft);
     return () => window.removeEventListener(COMPOSER_DRAFT_EVENT, handleDraft);
@@ -2822,47 +3433,49 @@ function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) 
 function usePanelAgentContexts({
   activeSessionId,
   profile,
+  toolRoute,
   missingFields,
+  ignoredFields,
+  rankMeta,
   summary,
   suggestions,
 }: {
   activeSessionId: string;
   profile: StudentProfile;
+  toolRoute?: RouterDecision;
   missingFields: Array<keyof StudentProfile>;
+  ignoredFields: Array<keyof StudentProfile>;
+  rankMeta?: RankMeta;
   summary: ReturnType<typeof buildStrategySummary>;
   suggestions: string[];
 }) {
+  const compactProfile = {
+    province: profile.province,
+    year: profile.year,
+    subjectTrack: profile.subjectTrack,
+    score: profile.score,
+    rank: profile.rank,
+    familyBudget: profile.familyBudget ?? profile.budget,
+    targetCities: profile.targetCities ?? (profile.cityPreference ? [profile.cityPreference] : undefined),
+    cityPreference: profile.cityPreference,
+    preferredMajors: profile.preferredMajors ?? profile.majorPreference?.slice(0, 4),
+    riskPreference: profile.riskPreference,
+    acceptPrivate: profile.acceptPrivate,
+    acceptSinoForeign: profile.acceptSinoForeign,
+    canLeaveProvince: profile.canLeaveProvince,
+    graduatePlan: profile.graduatePlan,
+    majorPreference: profile.majorPreference?.slice(0, 4),
+    avoidMajors: profile.avoidMajors?.slice(0, 4),
+  };
   useAgentContext({
-    description: "画像子 agent 上下文",
+    description: "高考画像短上下文",
     value:
-      `panelAgent=candidateProfile; threadId=${activeSessionId}; ` +
-      `职责=只维护考生画像字段和信息完整度，不生成院校清单。` +
-      `profile=${JSON.stringify(profile)}; missing=${missingFields.join(",") || "none"}。`,
-  });
-  useAgentContext({
-    description: "待补信息子 agent 上下文",
-    value:
-      `panelAgent=missingInfo; threadId=${activeSessionId}; ` +
-      `职责=只判断下一步最该补的字段并生成短追问。` +
-      `missing=${missingFields.join(",") || "none"}。`,
-  });
-  useAgentContext({
-    description: "策略摘要子 agent 上下文",
-    value:
-      `panelAgent=strategySummary; threadId=${activeSessionId}; ` +
-      `职责=只输出冲稳保策略摘要，不查询分数线。risk=${summary.risk}; body=${summary.body}`,
-  });
-  useAgentContext({
-    description: "趋势图子 agent 上下文",
-    value:
-      `panelAgent=admissionTrend; threadId=${activeSessionId}; ` +
-      "职责=只处理聊天中 scoreLineTrendChart 生成的图表数据、来源和 SVG 曲线解释；没有图表时不要生成默认趋势卡。",
-  });
-  useAgentContext({
-    description: "建议问题子 agent 上下文",
-    value:
-      `panelAgent=promptSuggestions; threadId=${activeSessionId}; ` +
-      `职责=只提供 5 条以内下一问建议。suggestions=${suggestions.join("；") || "none"}。`,
+      `thread=${activeSessionId}; profile=${JSON.stringify(compactProfile)}; ` +
+      `missing=${missingFields.slice(0, 6).join(",") || "none"}; ignored=${ignoredFields.join(",") || "none"}; ` +
+      `rankMeta=${rankMeta ? JSON.stringify(rankMeta) : "none"}; risk=${summary.risk}; ` +
+      `next=${suggestions.slice(0, 4).join("；") || "none"}; ` +
+      `toolRoute=${toolRoute ? buildAgentRouterContext(toolRoute) : "none"}; ` +
+      "规则：当前画像优先于历史聊天；省份=投档省份，城市=就读偏好；自动位次按rankMeta年份或2025参考。",
   });
 }
 
@@ -2892,17 +3505,6 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
         const allProcessDetails = Array.from(
           message.querySelectorAll<HTMLDetailsElement>('details[data-gaokao-process-kind="agent-thinking"]'),
         );
-
-        // 调试：记录找到的 process details 数量
-        if (process.env.NODE_ENV === "development" && allProcessDetails.length > 0) {
-          console.log(`[Compact] Found ${allProcessDetails.length} agent-thinking tools in message`, 
-            allProcessDetails.map(d => ({ 
-              kind: d.dataset.gaokaoProcessKind,
-              type: d.dataset.gaokaoToolType,
-              running: d.dataset.gaokaoRunning,
-              hasGroup: d.classList.contains('gaokao-tool-process-group')
-            })));
-        }
 
         // 少于 2 个不需要分组，但需要确保它们都是折叠状态（非运行中）
         if (allProcessDetails.length < 2) {
@@ -2964,9 +3566,11 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
           
           const title = document.createElement("span");
           title.className = "min-w-0 flex-1 truncate";
+          title.dataset.gaokaoGroupTitle = "true";
           title.textContent = groupTitle;
           
           const badge = document.createElement("span");
+          badge.dataset.gaokaoGroupBadge = "true";
           badge.className = runningDetail
             ? "shrink-0 rounded border border-red-100 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-700"
             : "shrink-0 rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700";
@@ -2983,10 +3587,10 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
           // 更新现有分组的标题和状态
           const summary = group.querySelector("summary");
           if (summary) {
-            const titleEl = summary.querySelector("span.min-w-0");
+            const titleEl = summary.querySelector<HTMLElement>("[data-gaokao-group-title]");
             if (titleEl) titleEl.textContent = groupTitle;
             
-            const badgeEl = summary.querySelector("span.shrink-0");
+            const badgeEl = summary.querySelector<HTMLElement>("[data-gaokao-group-badge]");
             if (badgeEl) {
               badgeEl.textContent = runningDetail ? "进行中" : "已完成";
               badgeEl.className = runningDetail
@@ -3054,11 +3658,6 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
           detail.style.margin = "0";
           detail.style.padding = "0";
         });
-        
-        // 调试日志：确认分组是否正确创建
-        if (process.env.NODE_ENV === "development") {
-          console.log(`[Compact] Grouped ${allProcessDetails.filter(d => !d.classList.contains('gaokao-tool-process-group')).length} agent-thinking tools, running=${!!runningDetail}, groupOpen=${group?.open}`);
-        }
       });
 
       window.setTimeout(() => {
@@ -3069,12 +3668,12 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
     const scheduleCompact = (mutations?: MutationRecord[]) => {
       if (suppressObserver) return;
       
-      // 如果是属性变化（如 data-gaokao-running），立即执行
+      // 如果是属性变化（如 data-gaokao-running），用短延迟合并批量状态更新
       const hasAttributeChange = mutations?.some(m => m.type === 'attributes');
       
       if (hasAttributeChange) {
-        // 立即执行，快速响应 tool call 状态变化
-        compact();
+        if (frame) window.cancelAnimationFrame(frame);
+        frame = window.requestAnimationFrame(compact);
       } else {
         // DOM 结构变化使用 RAF 防抖
         if (frame) window.cancelAnimationFrame(frame);
@@ -3088,7 +3687,7 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
       childList: true,
       subtree: true,
       attributes: true, // 监听属性变化（如 data-gaokao-running 从 true 变为 false）
-      attributeFilter: ["data-gaokao-running", "open"], // 只关注相关属性
+      attributeFilter: ["data-gaokao-running"], // 只关注工具运行状态，避免 open 自触发
     });
 
     return () => {
@@ -3100,6 +3699,8 @@ function useCompactAdmissionScoreToolGroups(activeSessionId: string) {
 
 function AdvisorChatSurface() {
   useMobileVisualViewport();
+  const { copilotkit } = useCopilotKit();
+  const { agent } = useAgent({ agentId: "default" });
   const dashboardScrollRef = useRef<HTMLElement | null>(null);
 
   const {
@@ -3116,8 +3717,19 @@ function AdvisorChatSurface() {
     upsertTurnContext,
     upsertSuggestions,
   } = useSessionInsights(activeSessionId);
+  const {
+    activeIgnoredFields,
+    activeProfilePanelCollapsed,
+    activeRankMeta,
+    clearIgnoredFields,
+    clearRankMeta,
+    setIgnoredFields,
+    setProfilePanelCollapsed,
+    upsertRankMeta,
+  } = useSessionUiState(activeSessionId);
   const rankHydrationKeyRef = useRef("");
   const manuallySubmittedPromptRef = useRef<{ prompt: string; submittedAt: number } | null>(null);
+  const submittingPromptRef = useRef(false);
   const hydrateRankForTurnContext = useCallback(
     (sessionId: string, turnContext: TurnContext, lastAssistantText: string) => {
       if (!canAutoHydrateRank(turnContext.profileAfterTurn)) return;
@@ -3134,11 +3746,18 @@ function AdvisorChatSurface() {
             subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
             updatedAt: nextTurnContext.updatedAt,
           });
+          upsertRankMeta(sessionId, {
+            year: rankResult.year ?? 2025,
+            source: "auto2025",
+            matchedScore: rankResult.matchedScore,
+            note: rankResult.rankSourceLabel ?? "2025一分一段参考",
+            sourceTitle: rankResult.source?.title,
+          });
           upsertTurnContext(sessionId, nextTurnContext);
         })
         .catch(() => undefined);
     },
-    [updateProfileFromPatch, upsertTurnContext],
+    [updateProfileFromPatch, upsertRankMeta, upsertTurnContext],
   );
   const handlePromptSubmitted = useCallback(
     (sessionId: string, prompt: string) => {
@@ -3149,6 +3768,26 @@ function AdvisorChatSurface() {
         previousSummary: activeSessionSummary,
         lastAssistantText,
       });
+      const scoreChanged =
+        typeof localTurnContext.profilePatch.score === "number" &&
+        localTurnContext.profilePatch.score !== activeProfile.score &&
+        typeof localTurnContext.profilePatch.rank !== "number";
+      if (scoreChanged) {
+        localTurnContext.profilePatch = { ...localTurnContext.profilePatch, rank: undefined };
+        localTurnContext.profileAfterTurn = { ...localTurnContext.profileAfterTurn, rank: undefined };
+        localTurnContext.toolRoute = routeAgentTurn({
+          userMessage: prompt,
+          profile: localTurnContext.profileAfterTurn as AgentStudentProfile,
+        });
+        clearRankMeta(sessionId);
+      }
+      if (typeof localTurnContext.profilePatch.rank === "number") {
+        upsertRankMeta(sessionId, {
+          year: 2025,
+          source: "user",
+          note: "用户提供位次，择校时对比2025投档/录取数据",
+        });
+      }
       autoRenameSessionFromPrompt(sessionId, prompt);
       updateProfileFromPatch(sessionId, localTurnContext.profilePatch);
       upsertTurnContext(sessionId, localTurnContext);
@@ -3164,6 +3803,26 @@ function AdvisorChatSurface() {
         })
           .then((remote) => {
             const mergedTurnContext = mergeRemoteTurnContext(localTurnContext, remote, activeProfile);
+            const remoteScoreChanged =
+              typeof mergedTurnContext.profilePatch.score === "number" &&
+              mergedTurnContext.profilePatch.score !== activeProfile.score &&
+              typeof mergedTurnContext.profilePatch.rank !== "number";
+            if (remoteScoreChanged) {
+              mergedTurnContext.profilePatch = { ...mergedTurnContext.profilePatch, rank: undefined };
+              mergedTurnContext.profileAfterTurn = { ...mergedTurnContext.profileAfterTurn, rank: undefined };
+              mergedTurnContext.toolRoute = routeAgentTurn({
+                userMessage: prompt,
+                profile: mergedTurnContext.profileAfterTurn as AgentStudentProfile,
+              });
+              clearRankMeta(sessionId);
+            }
+            if (typeof mergedTurnContext.profilePatch.rank === "number") {
+              upsertRankMeta(sessionId, {
+                year: 2025,
+                source: "user",
+                note: "用户提供位次，择校时对比2025投档/录取数据",
+              });
+            }
             updateProfileFromPatch(sessionId, mergedTurnContext.profilePatch);
             upsertTurnContext(sessionId, mergedTurnContext);
             hydrateRankForTurnContext(sessionId, mergedTurnContext, lastAssistantText);
@@ -3183,22 +3842,73 @@ function AdvisorChatSurface() {
       activeProfile,
       activeSessionSummary,
       autoRenameSessionFromPrompt,
+      clearRankMeta,
       hydrateRankForTurnContext,
       updateProfileFromPatch,
+      upsertRankMeta,
       upsertTurnContext,
     ],
   );
   useAutoSessionTitle(activeSessionId, handlePromptSubmitted, manuallySubmittedPromptRef);
   const authoritativeProfile = withDerivedProfile(activeTurnContext?.profileAfterTurn ?? activeProfile);
-  const missingFields = prioritizeMissingFields(authoritativeProfile, "", activeTurnContext?.missingPriority).slice(0, 8);
-  const completion = profileCompletion(authoritativeProfile);
-  const strategySummary = buildStrategySummary(authoritativeProfile, missingFields);
-  const dashboardSuggestions = uniqueTextItems([...activeSuggestions, ...FALLBACK_SUGGESTIONS]).slice(0, 7);
+  const missingFields = prioritizeMissingFields(
+    authoritativeProfile,
+    "",
+    activeTurnContext?.missingPriority,
+    activeIgnoredFields,
+  ).slice(0, 8);
+  const completion = profileCompletion(authoritativeProfile, activeIgnoredFields);
+  const strategySummary = buildStrategySummary(authoritativeProfile, missingFields, activeIgnoredFields);
+  const ignoredSuggestions = new Set(
+    activeIgnoredFields.flatMap((key) => SUGGESTION_TEMPLATE_BY_FIELD[key] ?? []),
+  );
+  const dashboardSuggestions = uniqueTextItems(
+    [...activeSuggestions, ...FALLBACK_SUGGESTIONS].filter((item) => !ignoredSuggestions.has(item)),
+  ).slice(0, 7);
+  const handleSubmitPrompt = useCallback(async (prompt: string) => {
+    if (submittingPromptRef.current) return;
+    submittingPromptRef.current = true;
+    manuallySubmittedPromptRef.current = { prompt, submittedAt: Date.now() };
+    handlePromptSubmitted(activeSessionId, prompt);
+    try {
+      const runtimeAgent = await waitForRuntimeAgent(copilotkit, agent);
+      if ((runtimeAgent as { isRunning?: boolean }).isRunning) return;
+      runtimeAgent.addMessage({
+        id:
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : `user-${Date.now()}`,
+        role: "user",
+        content: prompt,
+      });
+      copilotkit.clearSuggestions("default");
+      await copilotkit.runAgent({ agent: runtimeAgent });
+    } catch (error) {
+      console.error("[Gaokao Advisor] failed to submit prompt", error);
+    } finally {
+      submittingPromptRef.current = false;
+    }
+    window.setTimeout(() => {
+      dashboardScrollRef.current?.scrollTo({
+        top: dashboardScrollRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }, 120);
+  }, [activeSessionId, agent, copilotkit, handlePromptSubmitted]);
+
   useAssistantSuggestionRefresh({
     activeSessionId,
     profile: authoritativeProfile,
     missingPriority: activeTurnContext?.missingPriority,
+    ignoredFields: activeIgnoredFields,
     upsertSuggestions,
+  });
+  useInlineFollowUpOptions({
+    activeSessionId,
+    profile: authoritativeProfile,
+    ignoredFields: activeIgnoredFields,
+    onSelect: appendPromptToComposer,
+    onDeselect: removePromptFromComposer,
   });
 
   useEffect(() => {
@@ -3234,6 +3944,13 @@ function AdvisorChatSurface() {
           subjectTrack: authoritativeProfile.subjectTrack || rankResult.subjectTrack,
           updatedAt: nextTurnContext.updatedAt,
         });
+        upsertRankMeta(activeSessionId, {
+          year: rankResult.year ?? 2025,
+          source: "auto2025",
+          matchedScore: rankResult.matchedScore,
+          note: rankResult.rankSourceLabel ?? "2025一分一段参考",
+          sourceTitle: rankResult.source?.title,
+        });
         upsertTurnContext(activeSessionId, nextTurnContext);
       })
       .catch(() => undefined);
@@ -3246,20 +3963,27 @@ function AdvisorChatSurface() {
     authoritativeProfile.score,
     authoritativeProfile.subjectTrack,
     updateProfileFromPatch,
+    upsertRankMeta,
     upsertTurnContext,
   ]);
 
   useAgentContext({
     description: "会话边界与全局规则",
     value:
-      `threadId=${activeSessionId}; ${GAOKAO_STAGE_CONTEXT}` +
-      "每个可视化板块由独立 panel agent 上下文负责，不要把全部用户画像当成单一提示词环境。" +
-      "高考省份是投档省份，目标城市是就读偏好；当前画像优先级高于历史聊天文本。",
+      `thread=${activeSessionId}; ${GAOKAO_STAGE_CONTEXT}` +
+      "当前画像优先于历史聊天；高考省份=投档省份，目标城市=就读偏好。" +
+      `rankMeta=${activeRankMeta ? JSON.stringify(activeRankMeta) : "none"}; ` +
+      `ignoredMissingFields=${activeIgnoredFields.join(",") || "none"}; ` +
+      `router=${activeTurnContext?.toolRoute ? buildAgentRouterContext(activeTurnContext.toolRoute) : "none"}; ` +
+      "位次按rankMeta年份或2025参考口径与投档/录取数据对比；回答尽量短，关键内容交给受控UI。",
   });
   usePanelAgentContexts({
     activeSessionId,
     profile: authoritativeProfile,
+    toolRoute: activeTurnContext?.toolRoute,
     missingFields,
+    ignoredFields: activeIgnoredFields,
+    rankMeta: activeRankMeta,
     summary: strategySummary,
     suggestions: dashboardSuggestions,
   });
@@ -3269,6 +3993,21 @@ function AdvisorChatSurface() {
     description: "展示当前考生画像、缺失字段和下一步追问。适合在规划类问题追问前或补齐画像后使用。",
     parameters: studentProfileSummarySchema,
     render: StudentProfileSummary,
+    followUp: true,
+  });
+
+  useComponent({
+    name: "followUpQuestionOptions",
+    description:
+      "展示需要用户补充的问题和可点击选项。凡是追问省份、科类、分数、位次、预算、城市、出省、读研、专业偏好时，优先调用本组件；用户可多选，选项会填入输入框，最后由用户点击发送。",
+    parameters: followUpQuestionOptionsSchema,
+    render: (args) => (
+      <FollowUpQuestionOptions
+        {...args}
+        onSelect={appendPromptToComposer}
+        onDeselect={removePromptFromComposer}
+      />
+    ),
     followUp: true,
   });
 
@@ -3307,23 +4046,23 @@ function AdvisorChatSurface() {
 
   useComponent({
     name: "genericComparisonCard",
-    description: "渲染通用对比卡片，用于非院校对比场景（如专业对比、城市对比、职业路径对比等）。每个对比项用独立卡片展示，包含多个维度的详细信息。",
+    description: "通用对比卡片。用于专业/城市/职业路径对比。每项短句，不要长段。",
     parameters: z.object({
-      title: z.string().describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
+      title: z.string().max(40).describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
       items: z.array(
         z.object({
-          name: z.string().describe("对比项名称，如'计算机科学与技术'"),
-          icon: z.string().optional().describe("图标（可选）"),
+          name: z.string().max(20).describe("对比项名称，如'计算机科学与技术'"),
+          icon: z.string().max(4).optional().describe("图标（可选）"),
           dimensions: z.array(
             z.object({
-              label: z.string().describe("维度名称，如'学习内容'"),
-              value: z.string().describe("该维度的值"),
+              label: z.string().max(8).describe("维度名称，如'学习内容'"),
+              value: z.string().max(90).describe("该维度的短句值，不要长段"),
             })
-          ).min(1).max(10).describe("对比维度列表"),
-          verdict: z.string().optional().describe("总结性判断（可选）"),
+          ).min(3).max(5).describe("每项 3-5 个短维度，不允许空维度"),
+          verdict: z.string().max(80).describe("一句话结论，必须给出"),
         })
-      ).min(2).max(5).describe("对比项列表"),
-      summary: z.string().optional().describe("总结性建议"),
+      ).min(2).max(4).describe("对比项列表；最多 4 项，禁止空卡片"),
+      summary: z.string().max(120).optional().describe("一句总结"),
       sources: z.array(cardSourceSchema).optional(),
       warnings: z.array(z.string()).optional(),
     }),
@@ -3366,21 +4105,16 @@ function AdvisorChatSurface() {
     URL.revokeObjectURL(url);
   }, [authoritativeProfile, missingFields, strategySummary.body]);
 
-  const handleSubmitPrompt = useCallback((prompt: string) => {
-    manuallySubmittedPromptRef.current = { prompt, submittedAt: Date.now() };
-    handlePromptSubmitted(activeSessionId, prompt);
-    submitHiddenCopilotPrompt(prompt);
-    window.setTimeout(() => {
-      dashboardScrollRef.current?.scrollTo({
-        top: dashboardScrollRef.current.scrollHeight,
-        behavior: "smooth",
-      });
-    }, 120);
-  }, [activeSessionId, handlePromptSubmitted]);
   const handleIgnoreMissing = useCallback(() => {
-    const prompt = "忽略所有待补信息，直接基于当前画像给出志愿填报意见摘要。请明确说明由于信息不完整，建议只作为初步参考。";
+    setIgnoredFields(activeSessionId, missingFields);
+    const prompt =
+      `忽略这些待补信息：${missingFields.join("、") || "无"}。` +
+      "请直接基于当前画像给出志愿填报意见摘要；明确说明这是信息不完整时的初步参考，并优先使用当前画像和2025投档/位次口径。";
     handleSubmitPrompt(prompt);
-  }, [handleSubmitPrompt]);
+  }, [activeSessionId, handleSubmitPrompt, missingFields, setIgnoredFields]);
+  const handleRestoreMissing = useCallback(() => {
+    clearIgnoredFields(activeSessionId);
+  }, [activeSessionId, clearIgnoredFields]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -3391,12 +4125,16 @@ function AdvisorChatSurface() {
     if (!messageList) return;
 
     let frame = 0;
+    let lastScrollAt = 0;
     const scrollToLatest = () => {
+      const now = Date.now();
+      if (now - lastScrollAt < 180) return;
+      lastScrollAt = now;
       if (frame) window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         scrollRoot.scrollTo({
           top: scrollRoot.scrollHeight,
-          behavior: "smooth",
+          behavior: "auto",
         });
       });
     };
@@ -3423,9 +4161,14 @@ function AdvisorChatSurface() {
             profile={authoritativeProfile}
             completion={completion}
             missingCount={missingFields.length}
+            missingFields={missingFields}
+            ignoredCount={activeIgnoredFields.length}
+            isCollapsed={activeProfilePanelCollapsed}
+            rankMeta={activeRankMeta}
             strategySummary={strategySummary}
-            missingPriority={activeTurnContext?.missingPriority}
+            onToggleCollapsed={() => setProfilePanelCollapsed(activeSessionId, !activeProfilePanelCollapsed)}
             onIgnoreMissing={handleIgnoreMissing}
+            onRestoreMissing={handleRestoreMissing}
           />
           <AgentConversationPanel
             activeSessionId={activeSessionId}

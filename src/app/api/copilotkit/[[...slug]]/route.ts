@@ -10,6 +10,10 @@ import { spawn } from "node:child_process";
 import { z } from "zod";
 import { lookupAdmissionScores as lookupOfficialAdmissionScores } from "@/lib/gaokao-data";
 import { lookupRankByScoreFromVault } from "@/lib/gaokao-vault-data";
+import { logAgentToolCallAfter, logAgentToolCallBefore, summarizeToolResult } from "@/lib/agent/debug-log";
+import { DEFAULT_RANK_REFERENCE_YEAR } from "@/lib/agent/profile-extractor";
+import { buildFollowUpQuestions, validateProfileForTask } from "@/lib/agent/tool-policy";
+import type { StudentProfile, ToolName } from "@/lib/agent/types";
 
 const TIME_ZONE = "Asia/Shanghai";
 const GAOKAO_STAGE_CONTEXT =
@@ -20,6 +24,9 @@ const BING_SEARCH_ENDPOINT = "https://www.bing.com/search";
 const PUBLIC_SEARCH_TIMEOUT_MS = 5_000;
 const TAVILY_TIMEOUT_MS = 15_000;
 const MODEL_FETCH_TIMEOUT_MS = 60_000;
+const RESEARCH_LIMIT_WINDOW_MS = 2 * 60_000;
+const RESEARCH_MAX_CALLS_PER_BUCKET = 2;
+const researchCallBuckets = new Map<string, { count: number; expiresAt: number }>();
 
 function fetchWithTimeout(
   input: Parameters<typeof fetch>[0],
@@ -59,6 +66,49 @@ function getCurrentDateForPrompt() {
   }).format(now);
 }
 
+async function executeWithToolLogging<TArgs, TResult>(
+  selectedTool: ToolName,
+  args: TArgs,
+  execute: (args: TArgs) => Promise<TResult> | TResult,
+): Promise<TResult> {
+  const argObject = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const profileSnapshot =
+    "profile" in argObject && argObject.profile && typeof argObject.profile === "object"
+      ? (argObject.profile as StudentProfile)
+      : (argObject as StudentProfile);
+
+  logAgentToolCallBefore({
+    conversationId: "copilotkit-runtime",
+    userMessage: typeof argObject.query === "string" ? argObject.query : "",
+    detectedIntent: "runtime_tool_call",
+    selectedTool,
+    missingFields: Array.isArray(argObject.missingFields)
+      ? argObject.missingFields.filter((item): item is string => typeof item === "string")
+      : [],
+    reason: typeof argObject.reason === "string" ? argObject.reason : "",
+    profileSnapshot,
+  });
+
+  try {
+    const result = await execute(args);
+    logAgentToolCallAfter({
+      selectedTool,
+      ...summarizeToolResult(result),
+    });
+    return result;
+  } catch (error) {
+    logAgentToolCallAfter({
+      selectedTool,
+      success: false,
+      resultCount: 0,
+      hasSources: false,
+      warnings: [error instanceof Error ? error.message : String(error)],
+      fallbackUsed: false,
+    });
+    throw error;
+  }
+}
+
 const admissionLookupSchema = z.object({
   schoolName: z.string().min(2).describe("院校名称，例如：苏州大学"),
   province: z.string().min(2).describe("招生省份，例如：江苏"),
@@ -80,7 +130,8 @@ const lookupAdmissionScores = defineTool({
   description:
     "Official-first lookup for Gaokao admission scores. Use this before answering questions about a specific school's recent score lines. It tries the local gaokao-vault structured database first, including imported 2025 provincial institution admission lines such as 天津普通类本科批A阶段, then falls back to official parsers/search. Only use it for clearly specified school/province/subject/year queries; do not use it for broad all-school scans.",
   parameters: admissionLookupSchema,
-  execute: async (args) => lookupOfficialAdmissionScores(args),
+  execute: async (args) =>
+    executeWithToolLogging("lookupAdmissionScores", args, lookupOfficialAdmissionScores),
 });
 
 function resolveUvxCommand() {
@@ -259,14 +310,17 @@ const lookupRankByScore = defineTool({
     "Query score-to-rank data through gaokao-vault or the mcp-gaokao rank service. Use it only for rank supplementation, not as the authority for university admission score lines.",
   parameters: z.object({
     province: z.string().min(2).describe("省份，例如：江苏"),
-    year: z.string().min(4).describe("年份，例如：2025、2024本科"),
+    year: z
+      .union([z.string().min(4), z.number().int().min(2000).max(2030)])
+      .describe("年份，例如：2025、2024本科；可传字符串或数字"),
     subjectTrack: z.string().min(2).describe("科类，例如：物理类、历史类"),
     score: z.number().int().min(0).max(750).describe("高考分数"),
   }),
-  execute: async ({ province, year, subjectTrack, score }) => {
+  execute: async (args) =>
+    executeWithToolLogging("lookupRankByScore", args, async ({ province, year, subjectTrack, score }) => {
     const normalizedProvince = normalizeRankProvince(province);
     const normalizedSubjectTrack = normalizeRankSubjectTrack(subjectTrack);
-    const normalizedYear = year.trim();
+      const normalizedYear = String(year).trim();
     const numericYear = Number(normalizedYear.match(/\d{4}/)?.[0]);
     let adapterError: string | undefined;
 
@@ -392,14 +446,21 @@ const lookupRankByScore = defineTool({
         },
       };
     }
-  },
+    }),
 });
 
 const advisorProfileSchema = z.object({
   province: z.string().optional().describe("高考省份/投档省份，不是想去读大学的目标地区"),
+  year: z.number().optional().describe("高考年份或参考年份"),
   subjectTrack: z.string().optional().describe("科类或选科，例如物理类、历史类、理科、文科"),
   score: z.number().optional().describe("高考分数"),
   rank: z.number().optional().describe("全省位次"),
+  targetCities: z.array(z.string()).optional().describe("目标城市/地区偏好"),
+  preferredMajors: z.array(z.string()).optional().describe("专业偏好"),
+  familyBudget: z.string().optional().describe("家庭预算或成本约束"),
+  riskPreference: z.enum(["冲刺", "稳妥", "保守"]).optional().describe("风险偏好"),
+  acceptPrivate: z.boolean().optional().describe("是否接受民办"),
+  acceptSinoForeign: z.boolean().optional().describe("是否接受中外合作"),
   budget: z.string().optional().describe("家庭预算或成本约束"),
   cityPreference: z.string().optional().describe("目标城市/地区偏好，例如想去新疆、南京、长三角读大学"),
   canLeaveProvince: z.boolean().optional().describe("是否接受离开高考省份去外省读大学"),
@@ -429,6 +490,16 @@ function missingAdvisorFields(profile: z.infer<typeof advisorProfileSchema>) {
   return missing;
 }
 
+function toStudentProfile(profile: z.infer<typeof advisorProfileSchema> | undefined): StudentProfile {
+  return {
+    ...(profile ?? {}),
+    targetCities: profile?.targetCities ?? (profile?.cityPreference ? [profile.cityPreference] : undefined),
+    preferredMajors: profile?.preferredMajors ?? profile?.majorPreference,
+    familyBudget: profile?.familyBudget ?? profile?.budget,
+    year: profile?.year ?? DEFAULT_RANK_REFERENCE_YEAR,
+  };
+}
+
 const buildVolunteerPlan = defineTool({
   name: "buildVolunteerPlan",
   description:
@@ -440,63 +511,99 @@ const buildVolunteerPlan = defineTool({
     scoreEvidence: z.array(z.string()).optional(),
     sources: z.array(cardSourceSchema).optional(),
   }),
-  execute: async ({ profile, candidateSchools = [], preferences = [], scoreEvidence = [], sources = [] }) => {
-    const missing = missingAdvisorFields(profile);
-    const schools = candidateSchools.length
-      ? candidateSchools.slice(0, 9)
-      : ["目标院校A", "目标院校B", "目标院校C", "匹配院校A", "匹配院校B", "保底院校A"];
-    const majorDirection =
-      preferences[0] ?? profile.majorPreference?.[0] ?? "计算机/电子/电气等确定性较强方向";
+  execute: async (args) =>
+    executeWithToolLogging("buildVolunteerPlan", args, async ({ profile, candidateSchools = [], preferences = [], scoreEvidence = [], sources = [] }) => {
+      const normalizedProfile = toStudentProfile(profile);
+      const validation = validateProfileForTask(normalizedProfile, "volunteer_plan");
+      if (!validation.ok) {
+        return {
+          status: "needs_profile",
+          profile,
+          missingFields: validation.missingFields,
+          suggestedFields: validation.suggestedFields,
+          nextQuestions: validation.nextQuestions,
+          tiers: [],
+          warnings: [
+            "画像缺少省份、科类或分数/位次，不能生成学校推荐。",
+            "请先用 studentProfileSummary 和 followUpQuestionOptions 补齐关键信息。",
+          ],
+          sources,
+        };
+      }
 
-    return {
-      status: missing.includes("位次") || missing.includes("分数") ? "needs_profile" : "ok",
-      profile,
-      missingFields: missing,
-      tiers: [
-        {
-          tier: "冲",
-          items: schools.slice(0, 3).map((schoolName) => ({
-            schoolName,
-            groupName: "需核验目标专业组",
-            majorDirection,
-            evidence: scoreEvidence[0] ?? "需要结合近三年分数线、位次和招生计划确认。",
-            riskLevel: "高风险",
-            reason: "适合放在前排冲刺，但不能占用稳妥名额。",
-            sourceIds: sources.map((source) => source.id),
-          })),
-        },
-        {
-          tier: "稳",
-          items: schools.slice(3, 5).map((schoolName) => ({
-            schoolName,
-            groupName: "优先选择强专业组",
-            majorDirection,
-            evidence: scoreEvidence[1] ?? "分数/位次应接近或略高于近年最低门槛。",
-            riskLevel: "中风险",
-            reason: "作为主力选择，重点看专业方向和城市资源。",
-            sourceIds: sources.map((source) => source.id),
-          })),
-        },
-        {
-          tier: "保",
-          items: schools.slice(5, 8).map((schoolName) => ({
-            schoolName,
-            groupName: "避开高收费和弱适配专业组",
-            majorDirection,
-            evidence: scoreEvidence[2] ?? "保底项需要留出位次安全垫。",
-            riskLevel: "低风险",
-            reason: "保证有学上，同时尽量不牺牲专业和城市底线。",
-            sourceIds: sources.map((source) => source.id),
-          })),
-        },
-      ].filter((tier) => tier.items.length > 0),
-      warnings: [
-        missing.length ? `画像仍缺：${missing.join("、")}，方案只能作为草案。` : "冲稳保是辅助分层，不是最终录取承诺。",
-        "正式填报前必须按省考试院、院校招生章程和当年招生计划核验。",
-      ],
-      sources,
-    };
-  },
+      if (candidateSchools.length < 2) {
+        return {
+          status: "needs_data",
+          profile,
+          missingFields: [],
+          suggestedFields: validation.suggestedFields,
+          nextQuestions: buildFollowUpQuestions(["targetCities", "preferredMajors", "riskPreference"], 3),
+          tiers: [],
+          warnings: [
+            "没有足够的候选院校和分数线证据，不能用占位院校生成冲稳保方案。",
+            "请先查询目标院校分数线，或让用户补充目标城市/专业后再构造候选集。",
+          ],
+          sources,
+        };
+      }
+
+      const schools = candidateSchools.slice(0, 9);
+      const majorDirection =
+        preferences[0] ??
+        normalizedProfile.preferredMajors?.[0] ??
+        normalizedProfile.majorPreference?.[0] ??
+        "需结合专业组核验";
+
+      return {
+        status: "ok",
+        profile,
+        missingFields: [],
+        suggestedFields: validation.suggestedFields,
+        tiers: [
+          {
+            tier: "冲",
+            items: schools.slice(0, 3).map((schoolName) => ({
+              schoolName,
+              groupName: "需核验目标专业组",
+              majorDirection,
+              evidence: scoreEvidence[0] ?? "仅能基于已提供候选和证据初判，需继续核验近三年分数线。",
+              riskLevel: "高风险",
+              reason: "适合放在前排冲刺，但不能占用稳妥名额。",
+              sourceIds: sources.map((source) => source.id),
+            })),
+          },
+          {
+            tier: "稳",
+            items: schools.slice(3, 6).map((schoolName) => ({
+              schoolName,
+              groupName: "优先选择强专业组",
+              majorDirection,
+              evidence: scoreEvidence[1] ?? "分数/位次应接近或略高于近年最低门槛。",
+              riskLevel: "中风险",
+              reason: "作为主力选择，重点看专业方向和城市资源。",
+              sourceIds: sources.map((source) => source.id),
+            })),
+          },
+          {
+            tier: "保",
+            items: schools.slice(6, 9).map((schoolName) => ({
+              schoolName,
+              groupName: "避开高收费和弱适配专业组",
+              majorDirection,
+              evidence: scoreEvidence[2] ?? "保底项需要留出位次安全垫。",
+              riskLevel: "低风险",
+              reason: "保证有学上，同时尽量不牺牲专业和城市底线。",
+              sourceIds: sources.map((source) => source.id),
+            })),
+          },
+        ].filter((tier) => tier.items.length > 0),
+        warnings: [
+          "冲稳保是辅助分层，不是录取承诺。",
+          "正式填报前必须按省考试院、院校招生章程和当年招生计划核验。",
+        ],
+        sources,
+      };
+    }),
 });
 
 const explainAdmissionRisk = defineTool({
@@ -508,7 +615,8 @@ const explainAdmissionRisk = defineTool({
     target: z.string().optional(),
     scoreEvidence: z.array(z.string()).optional(),
   }),
-  execute: async ({ profile, target, scoreEvidence = [] }) => {
+  execute: async (args) =>
+    executeWithToolLogging("explainAdmissionRisk", args, async ({ profile, target, scoreEvidence = [] }) => {
     const targetUserType = profile?.familyType ?? "普通家庭考生";
     return {
       targetUserType,
@@ -546,7 +654,7 @@ const explainAdmissionRisk = defineTool({
       ],
       summary: "普通家庭的核心不是追最热，而是控制成本、提高就业确定性、保留升学空间。",
     };
-  },
+    }),
 });
 
 const compareSchools = defineTool({
@@ -561,7 +669,8 @@ const compareSchools = defineTool({
     sources: z.array(cardSourceSchema).optional(),
     warnings: z.array(z.string()).optional(),
   }),
-  execute: async ({ profile, schools, province, subjectTrack, sources = [], warnings = [] }) => {
+  execute: async (args) =>
+    executeWithToolLogging("compareSchools", args, async ({ profile, schools, province, subjectTrack, sources = [], warnings = [] }) => {
     return {
       profile: {
         ...profile,
@@ -585,42 +694,49 @@ const compareSchools = defineTool({
         ? warnings
         : ["学校对比必须结合分数线、专业组、招生计划和城市资源；缺数据时只做方向判断。"],
     };
-  },
+    }),
 });
 
-// 通用对比卡片工具（用于非院校对比场景）
+// 通用对比卡片工具（用于非院校对比场景）。前端同名 useComponent 负责把结构化参数渲染成卡片。
 const genericComparisonCard = defineTool({
   name: "genericComparisonCard",
   description:
-    "Render structured comparison cards for any 2-5 items (e.g., majors, cities, career paths, policies). Use this instead of Markdown tables for mobile-friendly display. Do NOT use for school comparisons; use compareSchools + schoolComparisonCard instead.",
+    "Render compact comparison cards for 2-4 non-school items. Use short phrases, not long paragraphs. Do not use for school comparisons.",
   parameters: z.object({
-    title: z.string().describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
-    items: z.array(
-      z.object({
-        name: z.string().describe("对比项名称，如'计算机科学与技术'"),
-        icon: z.string().optional().describe("图标（可选）"),
-        dimensions: z.array(
-          z.object({
-            label: z.string().describe("维度名称，如'学习内容'、'学习难度'、'就业前景'"),
-            value: z.string().describe("该维度的值"),
-          })
-        ).min(1).max(10).describe("对比维度列表"),
-        verdict: z.string().optional().describe("总结性判断（可选）"),
-      })
-    ).min(2).max(5).describe("对比项列表"),
-    summary: z.string().optional().describe("总结性建议"),
+    title: z.string().max(40).describe("对比主题，例如：计算机 vs 软件工程 vs 人工智能"),
+    items: z
+      .array(
+        z.object({
+          name: z.string().min(1).max(20).describe("对比项名称，如'计算机科学与技术'"),
+          icon: z.string().max(4).optional().describe("图标（可选）"),
+          dimensions: z
+            .array(
+              z.object({
+                label: z.string().min(1).max(8).describe("维度名称，如'学习内容'、'难度'、'就业'"),
+                value: z.string().min(1).max(90).describe("短句，不要长段"),
+              }),
+            )
+            .min(3)
+            .max(5)
+            .describe("每项 3-5 个短维度，不允许空维度"),
+          verdict: z.string().min(1).max(80).describe("一句话判断，必须填写"),
+        }),
+      )
+      .min(2)
+      .max(4)
+      .describe("对比项列表；最多 4 项，禁止空卡片"),
+    summary: z.string().max(120).optional().describe("一句总结"),
     sources: z.array(cardSourceSchema).optional().default([]),
     warnings: z.array(z.string()).optional().default([]),
   }),
-  execute: async ({ title, items, summary, sources, warnings }) => {
-    return {
+  execute: async (args) =>
+    executeWithToolLogging("genericComparisonCard", args, async ({ title, items, summary, sources, warnings }) => ({
       title,
       items,
       summary: summary ?? "以上对比仅供参考，请结合个人情况综合判断。",
       sources: sources || [],
       warnings: warnings || [],
-    };
-  },
+    })),
 });
 
 function decodeHtmlEntities(value: string) {
@@ -672,7 +788,7 @@ function extractBingResults(html: string) {
       results.push({ title, url: rawUrl, content });
     }
 
-    if (results.length >= 6) break;
+    if (results.length >= 4) break;
   }
 
   return results;
@@ -723,14 +839,14 @@ function extractSoResults(html: string, query: string) {
     if (!url || url.includes("javascript:")) continue;
 
     const title = stripHtml(linkMatch[2]);
-    const content = stripHtml(block.replace(linkMatch[0], " ")).slice(0, 360);
+    const content = stripHtml(block.replace(linkMatch[0], " ")).slice(0, 220);
     const result = { title, url, content };
 
     if (title && resultLooksRelevant(result, query) && !results.some((item) => item.url === url)) {
       results.push(result);
     }
 
-    if (results.length >= 6) break;
+    if (results.length >= 4) break;
   }
 
   return results;
@@ -753,7 +869,7 @@ function extractSogouResults(html: string, query: string) {
     const title = stripHtml(
       dataTitleMatch ? safeDecodeURIComponent(dataTitleMatch[1]) : (linkMatch?.[2] ?? ""),
     );
-    const content = stripHtml(block.replace(linkMatch?.[0] ?? "", " ")).slice(0, 360);
+    const content = stripHtml(block.replace(linkMatch?.[0] ?? "", " ")).slice(0, 220);
     const result = { title, url, content };
 
     if (title && resultLooksRelevant(result, query) && !results.some((item) => item.url === url)) {
@@ -767,9 +883,10 @@ function extractSogouResults(html: string, query: string) {
 }
 
 async function publicWebSearch(query: string) {
+  const officialScope = "官方 考试院 高校招生网 阳光高考 site:edu.cn OR site:gov.cn OR site:chsi.com.cn";
   const enrichedQuery = /高考|招生|录取|分数|投档|位次|专业|大学/.test(query)
-    ? query
-    : `${query} 高考 招生 录取分数 官方`;
+    ? `${query} ${officialScope}`
+    : `${query} 高考 招生 录取分数 ${officialScope}`;
   const providers = [
     {
       name: "so-html",
@@ -850,6 +967,27 @@ async function publicWebSearch(query: string) {
   };
 }
 
+function researchBucketKey(query: string) {
+  return query.replace(/\s+/g, "").slice(0, 80).toLowerCase();
+}
+
+function consumeResearchQuota(query: string) {
+  const now = Date.now();
+  researchCallBuckets.forEach((bucket, key) => {
+    if (bucket.expiresAt <= now) researchCallBuckets.delete(key);
+  });
+
+  const key = researchBucketKey(query);
+  const bucket = researchCallBuckets.get(key) ?? {
+    count: 0,
+    expiresAt: now + RESEARCH_LIMIT_WINDOW_MS,
+  };
+  if (bucket.count >= RESEARCH_MAX_CALLS_PER_BUCKET) return false;
+  bucket.count += 1;
+  researchCallBuckets.set(key, bucket);
+  return true;
+}
+
 const researchGaokaoData = defineTool({
   name: "researchGaokaoData",
   description:
@@ -863,7 +1001,22 @@ const researchGaokaoData = defineTool({
       ),
     reason: z.string().min(4).describe("Why this data is needed."),
   }),
-  execute: async ({ query, reason }) => {
+  execute: async (args) =>
+    executeWithToolLogging("researchGaokaoData", args, async ({ query, reason }) => {
+    if (!consumeResearchQuota(query)) {
+      return {
+        status: "rate_limited",
+        query,
+        reason,
+        message: "同一检索主题短时间内已调用 2 次联网搜索。本轮停止继续搜索，请基于已有来源说明缺口或请用户提供官方来源。",
+        results: [],
+        warnings: ["researchGaokaoData 已按 AGENT 工具策略限流，不能继续反复搜索同一主题。"],
+      };
+    }
+
+    const sourcePolicy =
+      "来源优先级：省级教育考试院/招办、高校本科招生网、阳光高考。非官方聚合页只能作为参考，不能当作确定结论。";
+
     if (!process.env.TAVILY_API_KEY) {
       const publicSearch = await publicWebSearch(query);
       return {
@@ -873,8 +1026,9 @@ const researchGaokaoData = defineTool({
         tavilyConfigured: false,
         message:
           publicSearch.status === "ok"
-            ? "TAVILY_API_KEY is not configured, so a public search fallback was used. Prefer official school/provincial sources when available; third-party aggregated score-line data may be charted only when the source clearly states year, school, province, subject track, and score, and must be labeled as third-party."
+            ? `TAVILY_API_KEY is not configured, so a public search fallback was used. ${sourcePolicy} Third-party aggregated score-line data may be charted only when the source clearly states year, school, province, subject track, and score, and must be labeled as third-party.`
             : "TAVILY_API_KEY is not configured and public search did not produce parseable results. Ask the user for an official source or configure Tavily.",
+        sourcePolicy,
         chartDataGuidance:
           "You may call scoreLineTrendChart from clearly labeled third-party aggregated sources when each chart point has an explicit year, school, province, subject track, and score. Mark the source as third-party in sources/warnings and say official verification is required. If rank is not disclosed, pass -1. Do not infer missing scores.",
       };
@@ -889,11 +1043,11 @@ const researchGaokaoData = defineTool({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             api_key: process.env.TAVILY_API_KEY,
-            query,
+            query: `${query} 官方 考试院 高校招生网 阳光高考`,
             search_depth: "basic",
             include_answer: true,
             include_raw_content: false,
-            max_results: 8,
+            max_results: 4,
           }),
         },
         TAVILY_TIMEOUT_MS,
@@ -924,17 +1078,18 @@ const researchGaokaoData = defineTool({
       query,
       reason,
       answer: data.answer,
+      sourcePolicy,
       chartDataGuidance:
         "You may call scoreLineTrendChart from clearly labeled third-party aggregated sources when each chart point has an explicit year, school, province, subject track, and score. Mark the source as third-party in sources/warnings and say official verification is required. If rank is not disclosed, pass -1. Do not infer missing scores.",
-      results: data.results?.map(
+      results: data.results?.slice(0, 4)?.map(
         (result: { title?: string; url?: string; content?: string }) => ({
           title: result.title,
           url: result.url,
-          content: result.content,
+          content: result.content?.slice(0, 220),
         }),
       ),
     };
-  },
+    }),
 });
 
 function buildAdvisorPrompt() {
@@ -947,7 +1102,7 @@ function buildAdvisorPrompt() {
 重要时间判断：现在已经是 2026 年。用户问 2025 年录取分数线时，默认这是已经发布的历史录取数据，必须先查官方数据；不要回答“2025 还没出来”。如果用户问 2026 年录取线，才说明录取未完成前没有最终录取线。
 如果用户问“今年高考还没考吗”“现在能不能按高考后判断”等，必须明确：以当前真实日期 ${getCurrentDateForPrompt()} 计，全国统考已经过去，多数地区已进入查分和志愿准备阶段；不要说 2026 年高考还没开始。
 
-产品形态：手机端高考志愿聊天 agent。不要让用户填表，不要输出复杂后台说明，用自然对话推进。手机端禁止输出 Markdown 表格、HTML 表格、CSV 风格列对齐或用空格模拟表格（不要写 | 学校 | 建议 |，也不要输出 <table>）；录取分数线必须优先使用 scoreLineTrendChart，文字明细只用短列表，不要把 rows 复述成表格。凡是推荐 2 所及以上学校、多个专业组、冲稳保清单或学校对比，必须先调用受控 UI：volunteerPlanCards 或 schoolComparisonCard；正文只写最终判断，不得用表格承载学校清单。工具调用、检索动作、数据整理动作会由前端折叠成“思考过程/检索过程”，不要在正文里复述这些过程。关键决策输出优先使用受控 UI：studentProfileSummary、volunteerPlanCards、admissionRiskCards、schoolComparisonCard。
+产品形态：手机端高考志愿聊天 agent。不要让用户填表，不要输出复杂后台说明，用自然对话推进。手机端禁止输出 Markdown 表格、HTML 表格、CSV 风格列对齐或用空格模拟表格（不要写 | 学校 | 建议 |，也不要输出 <table>）；录取分数线必须优先使用 scoreLineTrendChart，文字明细只用短列表，不要把 rows 复述成表格。凡是推荐 2 所及以上学校、多个专业组、冲稳保清单或学校对比，必须先调用受控 UI：volunteerPlanCards 或 schoolComparisonCard；正文只写最终判断，不得用表格承载学校清单。工具调用、检索动作、数据整理动作会由前端折叠成“思考过程/检索过程”，不要在正文里复述这些过程。关键决策输出优先使用受控 UI：studentProfileSummary、followUpQuestionOptions、volunteerPlanCards、admissionRiskCards、schoolComparisonCard。
 
 **重要规则：凡是对比类问题（非院校对比），必须使用 genericComparisonCard + GenericComparisonCard 组件输出卡片式对比 UI。**
 - 适用场景：专业对比（如计算机 vs 软件工程）、城市对比（如南京 vs 杭州）、职业路径对比（如读研 vs 直接就业）、政策对比等
@@ -961,11 +1116,13 @@ function buildAdvisorPrompt() {
 1b. 每个 threadId 是独立会话记忆。只能使用当前会话消息、当前本地画像和本轮工具结果，不要引用或合并其他会话的画像、偏好、院校结论。
 1c. 分数线和位次数据源优先级：省考试院/院校招生网 > gaokao-vault 结构化库 > mcp-gaokao 位次补充 > 联网搜索/第三方聚合。gaokao-vault 来自第三方开源入库，必须标注“结构化库/辅助参考”，不能冒充官方来源。gaokao-vault 只用于明确学校、投档省份、科类/类别和年份范围的定向查询，或明确省份/科类/分数/年份的一分一段位次查询；不要请求“全部学校/所有院校”的全量数据。
 1c. 前端会在隐藏上下文中提供“当前权威画像”和“本轮关键信息/profileAfterTurn”。这些字段优先级高于历史聊天文本、会话摘要和旧工具结果；如果用户把分数从 590 改为 530，当前权威画像里的 530 必须覆盖历史里的 590，生成方案和调用工具时也必须使用 530。
-2. 用户缺少位次、预算、城市偏好、读研意愿等关键条件时，先追问，不要直接给确定院校清单。追问 2 个以上问题时必须使用逐行 Markdown 有序列表。
+1d. 前端隐藏上下文可能提供 ignoredMissingFields。被忽略的字段不要再当成必须追问的缺口；可以说明“以下建议按已知信息初判”，但不要因为这些 ignored 字段继续卡住方案。
+1e. 前端隐藏上下文可能提供 rankMeta。rankMeta.source="auto2025" 表示位次来自 2025 年一分一段参考；rankMeta.source="user" 表示用户自己提供位次。无论哪种，择校时都用当前画像位次与 2025 年投档/录取数据对比，并说明 2025 口径。
+2. 用户缺少位次、预算、城市偏好、读研意愿等关键条件时，先追问，不要直接给确定院校清单。追问任何画像问题时，必须同时调用 followUpQuestionOptions 给出可点击选项；追问 2 个以上问题时正文可用逐行列表，但每个问题仍要配选项。选项支持多选，会填入输入框，用户确认后再发送。
 3. 对“我某省某科类某分，怎么选专业/学校”这类规划问题，如果用户只给分数没给位次：若当前权威画像或本轮信息已经有高考省份、科类/类别和分数，必须先调用 lookupRankByScore 自动补位次，再继续判断；若仍缺省份或科类，才追问缺口。
 3a. 用户明确问“多少名/位次/排名/一分一段/这个分在某省排多少”，或当前画像缺位次但已有省份、科类/类别和分数时，必须调用 lookupRankByScore。lookupRankByScore 已接入 gaokao-vault 的 score_segments，返回结果时说明这是结构化库/辅助参考，正式填报前仍以省考试院原表为准。
 4. 涉及最新院校分数线、专业录取、就业、政策或薪资时，必须先调用工具或让用户提供权威数据，不能凭空编。
-5. 院校分数线优先调用 lookupAdmissionScores。它会先尝试本地 gaokao-vault 定向结构化查询（已接入 2025 北京、天津、河北、江苏、上海、广东、贵州、山东、海南等省份/直辖市的本科批投档数据；其中天津为普通类本科批A阶段），再走省考试院/学校招生网解析，并会发现学校招生网历年分数入口。返回 ok/partial 且有 chartPoints 时，再调用 scoreLineTrendChart。若返回 sources 中有 official_school 但 rows/chartPoints 为空，下一步必须调用 researchGaokaoData，query 里带上学校名、年份、省份、科类和该官方招生网 URL/标题，优先围绕学校招生网提取数据。其他学校或官方解析不足时，再用 researchGaokaoData 兜底；如果第三方聚合页清楚给出年份、学校、省份、科类和分数，可以调用 scoreLineTrendChart 画图，但回答和 warnings 必须先说明“第三方聚合数据，正式填报前以官方核验”。
+5. 院校分数线优先调用 lookupAdmissionScores。它会先尝试本地 gaokao-vault 定向结构化查询（已接入 2025 北京、天津、河北、江苏、上海、广东、贵州、山东、海南等省份/直辖市的本科批投档数据；其中天津为普通类本科批A阶段），再走省考试院/学校招生网解析，并会发现学校招生网历年分数入口。**重要：如果 lookupAdmissionScores 返回 status="needs_data_source" 或 rows/chartPoints 为空，你必须立即调用 researchGaokaoData 进行兜底检索，绝对禁止直接生成文本描述！** 返回 ok/partial 且有 chartPoints 时，再调用 scoreLineTrendChart。若返回 sources 中有 official_school 但 rows/chartPoints 为空，下一步必须调用 researchGaokaoData，query 里带上学校名、年份、省份、科类和该官方招生网 URL/标题，优先围绕学校招生网提取数据。其他学校或官方解析不足时，再用 researchGaokaoData 兜底；如果第三方聚合页清楚给出年份、学校、省份、科类和分数，可以调用 scoreLineTrendChart 画图，但回答和 warnings 必须先说明“第三方聚合数据，正式填报前以官方核验”。
 6. 用户问“2025 某大学江苏物理类/历史类分数线是什么”时，调用 lookupAdmissionScores({ schoolName:"某大学", province:"江苏", subjectTrack:"物理类", yearRange:[2025], queryType:"groupComparison" })，有 chartPoints 再调用 scoreLineTrendChart，最后用 3-5 句话总结；没有结构化行就继续调用 researchGaokaoData，不要直接放弃。
 6a. 用户问“2025 某大学天津综合改革/天津本科A段/天津投档线是什么”时，调用 lookupAdmissionScores({ schoolName:"某大学", province:"天津", subjectTrack:"综合改革", yearRange:[2025], queryType:"groupComparison" })；命中后必须说明口径是“天津普通类本科批A阶段院校专业组投档线”，并调用 scoreLineTrendChart。
 7. 用户问“某大学近三年江苏物理类趋势”时，调用 lookupAdmissionScores({ schoolName:"某大学", province:"江苏", subjectTrack:"物理类", yearRange:[2023,2024,2025], queryType:"overallTrend" })，有 chartPoints 再调用 scoreLineTrendChart；只拿到部分年份时要说明缺口。
@@ -975,7 +1132,7 @@ function buildAdvisorPrompt() {
 7d. 严格说“一分一段”是省级同分位次表，不属于某个学校。用户说“某个学校的一分一段/位次线/分数对应位次”时，如果上下文是学校录取，按该校录取分数与最低位次调用 lookupAdmissionScores；如果用户给出具体分数并问“这个分在某省多少名”，才调用 lookupRankByScore。
 8. scoreLineTrendChart 的 points 必须来自 lookupAdmissionScores.chartPoints、lookupAdmissionScores.rows、官方院校/考试院页面正文、可核验第三方聚合页，或用户明确提供的数据；未知位次用 -1，不要估算。只有搜索片段含糊、来源互相矛盾或缺少年份/科类/分数时，才不要调用 scoreLineTrendChart。
 8a. 用户问“近五年/近三年/历年趋势”时，一次性查询整个年份范围，不要按年份循环调用多次搜索。若只查到 2-3 年有效数据，也要先画可核验数据并说明缺少年份；不要为了凑满年份反复检索导致对话卡住。
-9. 规划类问题先看画像。画像缺省份、科类、分数、位次、预算、城市偏好或读研/就业意愿时，调用 studentProfileSummary 展示当前画像和缺口，然后追问最关键的 2-4 项；追问后必须结束本轮，不要继续调用 buildVolunteerPlan、researchGaokaoData、openGenerativeUI 或输出占位符。
+9. 规划类问题先看画像。画像缺省份、科类、分数、位次、预算、城市偏好或读研/就业意愿时，调用 studentProfileSummary 展示当前画像和缺口，再调用 followUpQuestionOptions 追问最关键的 2-4 项；追问后必须结束本轮，不要继续调用 buildVolunteerPlan、researchGaokaoData、openGenerativeUI 或输出占位符。若这些字段出现在 ignoredMissingFields，则不要追问它们，可以基于已知信息给初步摘要。
 10. 当画像足够且用户要方案时，先调用 buildVolunteerPlan，再调用 volunteerPlanCards 渲染冲稳保卡片；正文只给 3-5 句最终判断。只要你的回答里准备出现 2 所及以上推荐学校或多个院校专业组，必须改为调用 volunteerPlanCards，不允许只在正文里列学校。
 11. 用户问普通家庭、专业避雷、不建议碰什么时，调用 explainAdmissionRisk，再调用 admissionRiskCards；必须明确“不建议碰/谨慎/可考虑”。
 12. 用户比较 2-3 所学校时，调用 compareSchools，再调用 schoolComparisonCard；必要时先查分数线或检索，但正文不写长篇对比。学校对比禁止用 Markdown 表格，必须用 schoolComparisonCard。
@@ -992,9 +1149,11 @@ function buildAdvisorPrompt() {
 - items: 对比项数组，每个对比项包含：
   - name: 对比项名称，如"计算机科学与技术"
   - icon: 图标（可选）
-  - dimensions: 对比维度列表，每个维度包含 label（维度名称）和 value（该维度的值）
-  - verdict: 总结性判断（可选）
+  - dimensions: 对比维度列表，每个对比项至少 3 个有效维度，每个维度必须包含非空 label 和 value
+  - verdict: 总结性判断，必须填写
 - summary: 总结性建议（可选）
+
+严禁输出空卡片、占位卡片、只有标题没有维度的 item。宁可少给 2-3 个完整对比项，也不要为了凑数量给空对象或半截对象。
 
 **示例：**
 {
@@ -1058,6 +1217,43 @@ function buildAdvisorPrompt() {
 `;
 }
 
+function buildAdvisorPromptCompact() {
+  return `
+你是高考志愿填报 agent，参考张雪峰公开方法论，但不要冒充本人。
+当前日期：${getCurrentDateForPrompt()}，时区：${TIME_ZONE}。${GAOKAO_STAGE_CONTEXT}
+
+核心规则：
+- 当前画像和本轮工具结果优先于历史聊天；用户改分数/位次后必须用最新值。
+- 高考省份=投档省份；目标城市/地区=就读偏好，二者不要混淆。
+- 2025 录取/投档数据视为可查历史数据；2026 最终录取线录取结束前不存在。
+- 手机端禁止 Markdown 表格/HTML 表格/CSV 对齐。正文短，关键内容交给受控 UI。
+- 工具过程不要在正文复述。不要写“我先查/我再搜/整理完成”。
+- 前端隐藏上下文会提供 router={detectedIntent, selectedTool, requiredTools, requiredUiComponents, missingFields, nextQuestions, mustAskFollowUp, reason}。这不是建议，是工具调度策略；mustAskFollowUp=true 时本轮只追问，不继续推荐。
+- 每轮优先完成一个主要动作；researchGaokaoData 同一主题最多短窗口 2 次。
+
+必须遵守：
+1. 涉及分数线、投档线、录取位次、近三年趋势时，必须优先调用 lookupAdmissionScores。
+2. 用户提供分数但没有位次，且省份、年份或默认参考年份、科类已知时，必须调用 lookupRankByScore 补全位次。
+3. 用户要求推荐学校或生成志愿方案时，必须先检查画像完整度。缺少省份、科类、分数/位次时，不得直接推荐。
+4. 画像缺失时，必须使用 studentProfileSummary 和 followUpQuestionOptions 引导用户补全。
+5. 推荐 2 所及以上学校时，必须调用 buildVolunteerPlan，并使用 volunteerPlanCards 展示；buildVolunteerPlan 返回 needs_profile/needs_data 时，不得强行列学校。
+6. 比较 2-3 所院校时，必须调用 compareSchools，并使用 schoolComparisonCard 展示。
+7. 专业、城市、读研/就业等非院校对比时，必须调用 genericComparisonCard，禁止只用 Markdown 表格。
+8. 专业风险、普通家庭避坑问题，必须调用 explainAdmissionRisk，并使用 admissionRiskCards 展示。
+9. 结构化库没有数据、或涉及最新政策/就业/薪资/官方信息时，才允许调用 researchGaokaoData。
+10. researchGaokaoData 结果必须标注来源、年份和可信度；优先省考试院、高校招生网、阳光高考，非官方来源只能作为参考。
+11. 不得编造分数线、位次、招生计划、录取概率、就业率。
+12. 没有可靠数据时，必须明确说明“当前没有可靠数据”，并给出下一步建议。
+13. 所有推荐都必须说明风险，不能说“一定能录取”“稳录”。
+14. 分数不等于录取概率，必须优先看位次、年份、省份、科类和专业组。
+
+输出预算：
+- 一般回答控制在 180-450 中文字。
+- 调用 UI 卡片后，正文只写排序/结论/下一步问题，不重复卡片细节。
+- 如果数据多，先给关键 3-5 条，提示可继续展开，不要一次性塞满。
+`;
+}
+
 const deepseek = createOpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com/v1",
@@ -1068,8 +1264,8 @@ const runtime = new CopilotRuntime({
   agents: {
     default: new BuiltInAgent({
       model: deepseek.chat(process.env.DEEPSEEK_MODEL || "deepseek-chat"),
-      prompt: buildAdvisorPrompt(),
-      maxSteps: 6,
+      prompt: buildAdvisorPromptCompact(),
+      maxSteps: 4,
       tools: [
         lookupAdmissionScores,
         lookupRankByScore,

@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import { DEFAULT_RANK_REFERENCE_YEAR } from "@/lib/agent/profile-extractor";
 import { lookupRankByScoreFromVault } from "@/lib/gaokao-vault-data";
 
 export const dynamic = "force-dynamic";
 
 const requestSchema = z.object({
   province: z.string().min(2),
-  year: z.number().int().min(2000).max(2030).default(2025),
+  year: z.number().int().min(2000).max(2030).default(DEFAULT_RANK_REFERENCE_YEAR),
   subjectTrack: z.string().min(1),
   score: z.number().int().min(0).max(750),
 });
@@ -54,8 +55,10 @@ export async function POST(request: Request) {
     status: "ok",
     rank: result.rank,
     matchedScore: result.matchedScore,
+    year: input.year,
     province: result.province,
     subjectTrack: result.subjectTrack,
     source: result.source,
+    rankSourceLabel: `${input.year}一分一段参考`,
   });
 }

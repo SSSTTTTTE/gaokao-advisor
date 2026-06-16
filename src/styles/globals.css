@@ -362,45 +362,66 @@ body {
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] table {
-  display: block;
+  display: table;
   width: 100%;
   max-width: 100%;
-  border: 0 !important;
-  border-collapse: separate !important;
+  min-width: 28rem;
+  border: 1px solid #dbeafe !important;
+  border-collapse: collapse !important;
   border-spacing: 0 !important;
-  overflow: visible;
+  background: #fff !important;
+  font-size: 0.8125rem !important;
+  line-height: 1.45 !important;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] thead {
-  display: none;
+  display: table-header-group;
+  background: #eff6ff !important;
 }
 
-.gaokao-chat [data-testid="copilot-assistant-message"] tbody,
-.gaokao-chat [data-testid="copilot-assistant-message"] tr,
-.gaokao-chat [data-testid="copilot-assistant-message"] th,
-.gaokao-chat [data-testid="copilot-assistant-message"] td {
-  display: block;
-  width: 100%;
+.gaokao-chat [data-testid="copilot-assistant-message"] tbody {
+  display: table-row-group;
+  width: auto;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] tr {
-  margin: 0.5rem 0;
-  overflow: hidden;
-  border: 1px solid #dbeafe !important;
-  border-radius: 0.75rem;
-  background: #fff;
+  display: table-row;
+  width: auto;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] th,
 .gaokao-chat [data-testid="copilot-assistant-message"] td {
+  display: table-cell;
+  width: auto;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] tr {
+  margin: 0;
+  overflow: visible;
   border: 0 !important;
-  border-bottom: 1px solid #eff6ff !important;
-  padding: 0.5rem 0.65rem !important;
+  border-radius: 0;
+  background: transparent !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] th,
+.gaokao-chat [data-testid="copilot-assistant-message"] td {
+  border: 1px solid #dbeafe !important;
+  padding: 0.45rem 0.55rem !important;
   word-break: break-word;
+  text-align: left !important;
+  vertical-align: top !important;
 }
 
 .gaokao-chat [data-testid="copilot-assistant-message"] tr > :last-child {
-  border-bottom: 0 !important;
+  border-bottom: 1px solid #dbeafe !important;
+}
+
+.gaokao-chat [data-testid="copilot-assistant-message"] .overflow-x-auto:has(> table) {
+  margin: 0.5rem 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
 }
 
 /* 重置受控 UI 组件内的表格样式影响 */

@@ -79,7 +79,7 @@ export function isGaokaoVaultConfigured() {
   return Boolean(getGaokaoVaultDsn());
 }
 
-function getPool() {
+export function getGaokaoVaultPool() {
   const dsn = getGaokaoVaultDsn();
   if (!dsn) return null;
 
@@ -289,7 +289,7 @@ async function lookupInstitutionAdmissionLinesFromVault(
   variants: string[],
   normalizedProvince: string,
 ): Promise<AdmissionLookupResult | null> {
-  const pool = getPool();
+  const pool = getGaokaoVaultPool();
   if (!pool) return null;
 
   try {
@@ -399,7 +399,7 @@ async function lookupInstitutionAdmissionLinesFromVault(
 export async function lookupAdmissionScoresFromVault(
   rawArgs: AdmissionLookupArgs,
 ): Promise<AdmissionLookupResult | null> {
-  const pool = getPool();
+  const pool = getGaokaoVaultPool();
   if (!pool) return null;
 
   const schoolName = rawArgs.schoolName.trim();
@@ -511,7 +511,7 @@ export async function lookupAdmissionScoresFromVault(
 }
 
 export async function lookupRankByScoreFromVault(args: RankLookupArgs) {
-  const pool = getPool();
+  const pool = getGaokaoVaultPool();
   if (!pool) return null;
 
   const normalizedProvince = normalizeProvinceName(args.province);

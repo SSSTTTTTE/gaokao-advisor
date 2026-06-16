@@ -76,11 +76,27 @@ export function detectAgentIntent(message: string, profile: StudentProfile = {})
   const compact = message.replace(/\s+/g, "");
   const schools = extractSchools(message);
   const majors = extractMajorItems(message);
+  if (/(检查志愿表|校验志愿|志愿表检查|帮我检查|看看这份志愿|志愿清单|志愿梯度)/.test(compact)) {
+    return "volunteer_list_validation";
+  }
+
   const hasSchoolCompareSignal = schools.length >= 2 && /(哪个|哪所|比较|对比|适合|更好|怎么选|还是|和|跟|与|vs|VS)/.test(compact);
   if (hasSchoolCompareSignal) return "school_comparison";
 
   if (/(普通家庭|家里普通|避坑|避雷|不建议|别碰|慎选|哪些专业不建议|不要碰)/.test(compact)) {
     return "major_risk";
+  }
+
+  if (schools.length >= 1 && /(位次趋势|最低位次趋势|近三年位次|近五年位次|位次线|排位趋势)/.test(compact)) {
+    return "admission_rank_trend";
+  }
+
+  if (/(招生章程|录取规则|专业级差|分数优先|专业优先|调剂规则|服从调剂|体检|色盲|色弱|限报|政审|口试|单科|外语要求|选科要求)/.test(compact)) {
+    return "admission_requirements_lookup";
+  }
+
+  if (/(招生计划|招几人|招多少人|计划数|招生人数|学费|学制|校区|专业代码|院校代码)/.test(compact)) {
+    return "enrollment_plan_lookup";
   }
 
   const hasScoreLineSignal = /(分数线|投档线|录取线|最低分|最低位次|近三年|近五年|历年|趋势|走势|多少分|够不够)/.test(compact);
@@ -286,6 +302,60 @@ export function routeAgentTurn({
       schools,
       majors,
       warnings: validation.warnings,
+    });
+  }
+
+  if (detectedIntent === "enrollment_plan_lookup") {
+    return completeDecision({
+      detectedIntent,
+      selectedTool: "lookupEnrollmentPlan",
+      requiredTools: ["lookupEnrollmentPlan"],
+      reason: "用户询问招生计划、招生人数、学费、学制、校区或专业代码，必须查询官方招生计划入库数据。",
+      profilePatch,
+      profileSnapshot: mergedProfile,
+      schools,
+      majors,
+      scoreLineLookup,
+    });
+  }
+
+  if (detectedIntent === "admission_requirements_lookup") {
+    return completeDecision({
+      detectedIntent,
+      selectedTool: "lookupAdmissionRequirements",
+      requiredTools: ["lookupAdmissionRequirements"],
+      reason: "用户询问招生章程、录取规则、选科、体检、单科、外语或限报要求，必须查询官方章程/计划规则。",
+      profilePatch,
+      profileSnapshot: mergedProfile,
+      schools,
+      majors,
+    });
+  }
+
+  if (detectedIntent === "admission_rank_trend") {
+    return completeDecision({
+      detectedIntent,
+      selectedTool: "lookupAdmissionRankTrend",
+      requiredTools: ["lookupAdmissionRankTrend"],
+      reason: "用户询问院校历史最低位次或位次趋势，使用历史投档线和一分一段补齐趋势。",
+      profilePatch,
+      profileSnapshot: mergedProfile,
+      schools,
+      majors,
+      scoreLineLookup,
+    });
+  }
+
+  if (detectedIntent === "volunteer_list_validation") {
+    return completeDecision({
+      detectedIntent,
+      selectedTool: "validateVolunteerList",
+      requiredTools: ["validateVolunteerList"],
+      reason: "用户要求检查志愿表或志愿清单，校验梯度、招生计划、选科和限报风险。",
+      profilePatch,
+      profileSnapshot: mergedProfile,
+      schools,
+      majors,
     });
   }
 

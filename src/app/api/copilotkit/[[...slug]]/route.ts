@@ -10,6 +10,12 @@ import { spawn } from "node:child_process";
 import { z } from "zod";
 import { lookupAdmissionScores as lookupOfficialAdmissionScores } from "@/lib/gaokao-data";
 import { lookupRankByScoreFromVault } from "@/lib/gaokao-vault-data";
+import {
+  lookupAdmissionRankTrendFromVault,
+  lookupAdmissionRequirementsFromVault,
+  lookupEnrollmentPlanFromVault,
+  validateVolunteerListWithVault,
+} from "@/lib/gaokao-planning-data";
 import { logAgentToolCallAfter, logAgentToolCallBefore, summarizeToolResult } from "@/lib/agent/debug-log";
 import { DEFAULT_RANK_REFERENCE_YEAR } from "@/lib/agent/profile-extractor";
 import { buildFollowUpQuestions, validateProfileForTask } from "@/lib/agent/tool-policy";
@@ -499,6 +505,82 @@ function toStudentProfile(profile: z.infer<typeof advisorProfileSchema> | undefi
     year: profile?.year ?? DEFAULT_RANK_REFERENCE_YEAR,
   };
 }
+
+const lookupEnrollmentPlan = defineTool({
+  name: "lookupEnrollmentPlan",
+  description:
+    "Official-only lookup for the 2026 enrollment plan. Use for questions about招生计划、招几人、招生人数、学费、学制、校区、专业代码、院校代码、选科要求. If no official structured data is available, return needs_data_source and do not infer.",
+  parameters: z.object({
+    province: z.string().min(1).describe("投档省份/高考省份，例如：江苏、天津"),
+    year: z.number().int().min(2000).max(2030).default(2026).describe("招生计划年份，第一版默认 2026"),
+    subjectTrack: z.string().min(0).default("").describe("科类或选科，例如物理类、历史类、综合改革；未知可传空字符串"),
+    schoolName: z.string().optional().describe("院校名称，例如：苏州大学"),
+    majorName: z.string().optional().describe("专业名称或方向，例如：计算机、临床医学"),
+    batch: z.string().optional().describe("批次，例如：普通本科批、本科批、本科A段"),
+  }),
+  execute: async (args) =>
+    executeWithToolLogging("lookupEnrollmentPlan", args, lookupEnrollmentPlanFromVault),
+});
+
+const lookupAdmissionRequirements = defineTool({
+  name: "lookupAdmissionRequirements",
+  description:
+    "Official-only lookup for admission brochure rules and major restrictions. Use for招生章程、录取规则、调剂规则、选科要求、体检、色盲色弱、政审、口试、单科或外语要求. If no official source is in the database, return needs_data_source.",
+  parameters: z.object({
+    schoolName: z.string().min(2).describe("院校名称，例如：苏州大学"),
+    year: z.number().int().min(2000).max(2030).default(2026).describe("章程年份，第一版默认 2026"),
+    province: z.string().optional().describe("投档省份/高考省份；用于专业计划限制查询"),
+    majorName: z.string().optional().describe("专业名称或方向"),
+    groupName: z.string().optional().describe("专业组名称或代码"),
+  }),
+  execute: async (args) =>
+    executeWithToolLogging("lookupAdmissionRequirements", args, lookupAdmissionRequirementsFromVault),
+});
+
+const lookupAdmissionRankTrend = defineTool({
+  name: "lookupAdmissionRankTrend",
+  description:
+    "Look up historical minimum-rank trend for a specific school/province/subject by combining official institution admission lines and score_segments. Use for近三年最低位次、位次趋势、排位趋势、位次线. 2026 final admission lines are not available before admission ends, so this uses historical reference years.",
+  parameters: z.object({
+    schoolName: z.string().min(2).describe("院校名称，例如：苏州大学"),
+    province: z.string().min(2).describe("投档省份，例如：江苏"),
+    subjectTrack: z.string().min(1).describe("科类或选科，例如：物理类、历史类、综合改革"),
+    yearRange: z
+      .array(z.number().int().min(2000).max(2030))
+      .min(1)
+      .max(5)
+      .default([2023, 2024, 2025])
+      .describe("历史参考年份，默认近三年 2023-2025"),
+    queryType: z.enum(["overallTrend", "groupComparison"]).optional(),
+  }),
+  execute: async (args) =>
+    executeWithToolLogging("lookupAdmissionRankTrend", args, lookupAdmissionRankTrendFromVault),
+});
+
+const validateVolunteerList = defineTool({
+  name: "validateVolunteerList",
+  description:
+    "Validate a Gaokao volunteer list for gradient, enrollment-plan availability, subject requirements, tuition/cooperation/private-school risk, and restriction risk. Use when the user asks to check a志愿表/志愿清单.",
+  parameters: z.object({
+    profile: advisorProfileSchema,
+    items: z
+      .array(
+        z.object({
+          schoolName: z.string().min(1),
+          groupName: z.string().optional(),
+          majorName: z.string().optional(),
+          majorDirection: z.string().optional(),
+          tier: z.string().optional().describe("冲、稳、保或用户原始分层"),
+        }),
+      )
+      .min(1)
+      .max(60),
+  }),
+  execute: async (args) =>
+    executeWithToolLogging("validateVolunteerList", args, async ({ profile, items }) =>
+      validateVolunteerListWithVault({ profile: toStudentProfile(profile), items }),
+    ),
+});
 
 const buildVolunteerPlan = defineTool({
   name: "buildVolunteerPlan",
@@ -1227,25 +1309,30 @@ function buildAdvisorPromptCompact() {
 - 高考省份=投档省份；目标城市/地区=就读偏好，二者不要混淆。
 - 2025 录取/投档数据视为可查历史数据；2026 最终录取线录取结束前不存在。
 - 手机端禁止 Markdown 表格/HTML 表格/CSV 对齐。正文短，关键内容交给受控 UI。
+- 禁止在正文里模拟院校卡片、分数卡片或对比卡片；不要用“学校名 + 分数 + emoji/风险标签”的块状列表替代受控 UI。
 - 工具过程不要在正文复述。不要写“我先查/我再搜/整理完成”。
 - 前端隐藏上下文会提供 router={detectedIntent, selectedTool, requiredTools, requiredUiComponents, missingFields, nextQuestions, mustAskFollowUp, reason}。这不是建议，是工具调度策略；mustAskFollowUp=true 时本轮只追问，不继续推荐。
 - 每轮优先完成一个主要动作；researchGaokaoData 同一主题最多短窗口 2 次。
 
 必须遵守：
 1. 涉及分数线、投档线、录取位次、近三年趋势时，必须优先调用 lookupAdmissionScores。
-2. 用户提供分数但没有位次，且省份、年份或默认参考年份、科类已知时，必须调用 lookupRankByScore 补全位次。
-3. 用户要求推荐学校或生成志愿方案时，必须先检查画像完整度。缺少省份、科类、分数/位次时，不得直接推荐。
-4. 画像缺失时，必须使用 studentProfileSummary 和 followUpQuestionOptions 引导用户补全。
-5. 推荐 2 所及以上学校时，必须调用 buildVolunteerPlan，并使用 volunteerPlanCards 展示；buildVolunteerPlan 返回 needs_profile/needs_data 时，不得强行列学校。
-6. 比较 2-3 所院校时，必须调用 compareSchools，并使用 schoolComparisonCard 展示。
-7. 专业、城市、读研/就业等非院校对比时，必须调用 genericComparisonCard，禁止只用 Markdown 表格。
-8. 专业风险、普通家庭避坑问题，必须调用 explainAdmissionRisk，并使用 admissionRiskCards 展示。
-9. 结构化库没有数据、或涉及最新政策/就业/薪资/官方信息时，才允许调用 researchGaokaoData。
-10. researchGaokaoData 结果必须标注来源、年份和可信度；优先省考试院、高校招生网、阳光高考，非官方来源只能作为参考。
-11. 不得编造分数线、位次、招生计划、录取概率、就业率。
-12. 没有可靠数据时，必须明确说明“当前没有可靠数据”，并给出下一步建议。
-13. 所有推荐都必须说明风险，不能说“一定能录取”“稳录”。
-14. 分数不等于录取概率，必须优先看位次、年份、省份、科类和专业组。
+2. 用户问招生计划、招几人、招生人数、学费、学制、校区、专业代码或院校代码时，必须调用 lookupEnrollmentPlan；没有官方入库数据时不得估算。
+3. 用户问招生章程、录取规则、调剂、选科要求、体检、色盲色弱、政审、口试、单科或外语要求时，必须调用 lookupAdmissionRequirements。
+4. 用户问近三年最低位次、位次趋势、排位趋势或位次线时，必须调用 lookupAdmissionRankTrend；2026 最终录取线未形成前只能用 2023-2025 历史参考。
+5. 用户让你检查志愿表/志愿清单/志愿梯度时，必须调用 validateVolunteerList，不要只凭文字感觉判断。
+6. 用户提供分数但没有位次，且省份、年份或默认参考年份、科类已知时，必须调用 lookupRankByScore 补全位次。
+7. 用户要求推荐学校或生成志愿方案时，必须先检查画像完整度。缺少省份、科类、分数/位次时，不得直接推荐。
+8. 画像缺失时，必须使用 studentProfileSummary 和 followUpQuestionOptions 引导用户补全。
+9. 推荐 2 所及以上学校、多个专业组或冲稳保清单时，必须调用 buildVolunteerPlan，并使用 volunteerPlanCards 展示；正文不得列出 2 所及以上院校或专业组。buildVolunteerPlan 返回 needs_profile/needs_data 时，不得强行列学校。
+10. 比较 2-3 所院校时，必须调用 compareSchools，并使用 schoolComparisonCard 展示。
+11. 专业、城市、读研/就业等非院校对比时，必须调用 genericComparisonCard，禁止只用 Markdown 表格。
+12. 专业风险、普通家庭避坑问题，必须调用 explainAdmissionRisk，并使用 admissionRiskCards 展示。
+13. 结构化库没有数据、或涉及最新政策/就业/薪资/官方信息时，才允许调用 researchGaokaoData。
+14. researchGaokaoData 结果必须标注来源、年份和可信度；优先省考试院、高校招生网、阳光高考，非官方来源只能作为参考。
+15. 不得编造分数线、位次、招生计划、录取概率、就业率、学费、选科要求或章程规则。
+16. 没有可靠数据时，必须明确说明“当前没有可靠数据”，并给出下一步建议。
+17. 所有推荐都必须说明风险，不能说“一定能录取”“稳录”。
+18. 分数不等于录取概率，必须优先看位次、年份、省份、科类、专业组和当年招生计划。
 
 输出预算：
 - 一般回答控制在 180-450 中文字。
@@ -1269,6 +1356,10 @@ const runtime = new CopilotRuntime({
       tools: [
         lookupAdmissionScores,
         lookupRankByScore,
+        lookupEnrollmentPlan,
+        lookupAdmissionRequirements,
+        lookupAdmissionRankTrend,
+        validateVolunteerList,
         buildVolunteerPlan,
         explainAdmissionRisk,
         compareSchools,

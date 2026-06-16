@@ -1466,21 +1466,21 @@ function FollowUpQuestionOptions({
       row.className = "mt-2 flex gap-2 overflow-x-auto pb-1";
 
       question.options.slice(0, 6).forEach((option) => {
-        const prompt = option.prompt?.trim() || option.value?.trim() || option.label;
+        const normalizedOption = normalizeFollowUpOption(option);
+        if (!normalizedOption) return;
+        const { label: optionLabel, prompt } = normalizedOption;
         const button = document.createElement("button");
         button.type = "button";
-        button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700 active:scale-[0.98]";
-        button.textContent = option.label;
+        button.textContent = optionLabel;
+        applyFollowUpButtonState(button, composerDraftIncludesPrompt(prompt));
         button.addEventListener("click", () => {
           const selected = button.dataset.selected === "true";
           if (selected) {
-            button.dataset.selected = "false";
-            button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700 active:scale-[0.98]";
+            applyFollowUpButtonState(button, false);
             onDeselect(prompt);
             return;
           }
-          button.dataset.selected = "true";
-          button.className = "shrink-0 rounded-xl border border-blue-600 bg-blue-600 px-3.5 py-2 text-sm font-black text-white shadow-sm active:scale-[0.98]";
+          applyFollowUpButtonState(button, true);
           onSelect(prompt);
         });
         row.append(button);
@@ -2510,10 +2510,28 @@ function buildInlineFollowUpQuestions(
     /需要(?:告诉|补充|确认|说)|请(?:补充|告诉|确认)|能接受.*吗|能不能|有没有|更倾向|还是|方向(?:是|吗)|城市.*(?:是|吗)|预算.*多少|位次.*吗|吗[？?]|[？?]/.test(text);
   if (!asksForMore) return [];
 
-  void profile;
-  void ignoredFields;
+  const ignored = new Set(normalizeIgnoredKeys(ignoredFields));
+  const hasProfileValue = (field: keyof StudentProfile) => {
+    const value = profile[field];
+    if (value !== undefined && value !== "" && (!Array.isArray(value) || value.length > 0)) return true;
+    if (field === "budget") return Boolean(profile.familyBudget || profile.budget);
+    if (field === "cityPreference") return Boolean(profile.cityPreference || profile.targetCities?.length);
+    if (field === "majorPreference") return Boolean(profile.majorPreference?.length || profile.preferredMajors?.length);
+    return false;
+  };
+  const hasDraftAnswer = (field: keyof StudentProfile) => {
+    const options = FOLLOW_UP_OPTIONS_BY_FIELD[field] ?? [];
+    return options.some((option) => composerDraftIncludesPrompt(option.prompt));
+  };
+  const shouldAskField = (field: keyof StudentProfile) => {
+    if (ignored.has(field)) return false;
+    if (hasProfileValue(field)) return false;
+    if (hasDraftAnswer(field)) return false;
+    return true;
+  };
   const questions: Array<{ field: keyof StudentProfile; question: string }> = [];
   const push = (field: keyof StudentProfile, question: string) => {
+    if (!shouldAskField(field)) return;
     if (questions.some((item) => item.field === field)) return;
     questions.push({ field, question });
   };
@@ -2565,6 +2583,46 @@ function dedupeFollowUpQuestions(questions: FollowUpQuestionOptionsArgs["questio
   });
 }
 
+const FOLLOWUP_BUTTON_BASE_CLASS =
+  "shrink-0 rounded-xl border px-3.5 py-2 text-sm font-black active:scale-[0.98]";
+const FOLLOWUP_BUTTON_IDLE_CLASS = `${FOLLOWUP_BUTTON_BASE_CLASS} border-blue-100 bg-blue-50 text-blue-700`;
+const FOLLOWUP_BUTTON_SELECTED_CLASS = `${FOLLOWUP_BUTTON_BASE_CLASS} border-blue-600 bg-blue-600 text-white shadow-sm`;
+
+function splitComposerDraft(value: string) {
+  return value
+    .split("；")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getCurrentComposerDraft() {
+  const visibleTextarea = document.querySelector<HTMLTextAreaElement>(".gaokao-text-composer textarea");
+  const hiddenTextarea = document.querySelector<HTMLTextAreaElement>(COPILOT_CHAT_TEXTAREA_SELECTOR);
+  return visibleTextarea?.value || hiddenTextarea?.value || "";
+}
+
+function composerDraftIncludesPrompt(prompt: string) {
+  return splitComposerDraft(getCurrentComposerDraft()).includes(prompt.trim());
+}
+
+function applyFollowUpButtonState(button: HTMLButtonElement, selected: boolean) {
+  button.dataset.selected = selected ? "true" : "false";
+  button.setAttribute("aria-pressed", selected ? "true" : "false");
+  button.className = selected ? FOLLOWUP_BUTTON_SELECTED_CLASS : FOLLOWUP_BUTTON_IDLE_CLASS;
+}
+
+type FollowUpOption = FollowUpQuestionOptionsArgs["questions"][number]["options"][number];
+
+function normalizeFollowUpOption(option: FollowUpOption | undefined) {
+  const label = typeof option?.label === "string" ? option.label.trim() : "";
+  const value = typeof option?.value === "string" ? option.value.trim() : "";
+  const prompt = typeof option?.prompt === "string" ? option.prompt.trim() : "";
+  const safePrompt = prompt || value || label;
+  const safeLabel = label || value || prompt;
+  if (!safePrompt || !safeLabel) return null;
+  return { label: safeLabel, prompt: safePrompt };
+}
+
 function useInlineFollowUpOptions({
   activeSessionId,
   profile,
@@ -2606,9 +2664,8 @@ function useInlineFollowUpOptions({
         if (latestMessage.querySelector('[data-gaokao-running="true"]')) return;
         const text = latestMessage.innerText.trim();
         const questions = buildInlineFollowUpQuestions(text, profile, ignoredFields);
-        if (!questions.length) return;
-
         latestMessage.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+        if (!questions.length) return;
         const container = document.createElement("div");
         container.className = "gaokao-inline-followup-options mt-3 grid gap-2";
         container.dataset.gaokaoInlineFollowup = "true";
@@ -2624,21 +2681,23 @@ function useInlineFollowUpOptions({
           const buttonRow = document.createElement("div");
           buttonRow.className = "mt-2 flex gap-2 overflow-x-auto pb-1";
           question.options.slice(0, 5).forEach((option) => {
-            const prompt = option.prompt?.trim() || option.label;
+            const normalizedOption = normalizeFollowUpOption(option);
+            if (!normalizedOption) return;
+            const { label: optionLabel, prompt } = normalizedOption;
             const button = document.createElement("button");
             button.type = "button";
-            button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700";
-            button.textContent = option.label;
+            button.textContent = optionLabel;
+            applyFollowUpButtonState(button, composerDraftIncludesPrompt(prompt));
             button.addEventListener("click", () => {
               if (button.dataset.selected === "true") {
-                button.dataset.selected = "false";
-                button.className = "shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-black text-blue-700";
+                applyFollowUpButtonState(button, false);
                 onDeselect(prompt);
+                timers.add(window.setTimeout(enhance, 80));
                 return;
               }
-              button.dataset.selected = "true";
-              button.className = "shrink-0 rounded-xl border border-blue-600 bg-blue-600 px-3.5 py-2 text-sm font-black text-white shadow-sm";
+              applyFollowUpButtonState(button, true);
               onSelect(prompt);
+              timers.add(window.setTimeout(enhance, 80));
             });
             buttonRow.append(button);
           });

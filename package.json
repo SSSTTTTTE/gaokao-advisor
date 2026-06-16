@@ -7,6 +7,7 @@
     "example-build": "next build",
     "example-start": "next start",
     "test:agent-router": "vitest run src/lib/agent/__tests__/tool-router.test.ts",
+    "import:planning-2026": "node scripts/import-2026-official-planning-data.mjs",
     "lint": "next lint",
     "clean": "rm -rf .turbo && rm -rf node_modules && rm -rf dist && rm -rf .next"
   },

@@ -42,6 +42,17 @@ GAOKAO_VAULT_DATABASE_URL=postgresql://gaokao:gaokao@localhost:5432/gaokao_vault
 
 When configured, the app tries `gaokao-vault` first for `major_admission_results` and `score_segments`. Results are labeled as a third-party structured data library, so official examination authority and university admission sites still remain the final source for filling decisions.
 
+## Optional Quark Public Data Probe
+
+The app includes a narrow read-only Quark public endpoint wrapper for basic college list metadata:
+
+```text
+GET /api/gaokao/quark-colleges?keyword=苏州大学&limit=10
+GET /api/gaokao/quark-colleges?province=江苏&type=综合类&tag=211
+```
+
+This wrapper only calls a publicly reachable JSON endpoint and filters locally. It intentionally does not spoof Quark Browser, call signed recommendation APIs, or use Quark-only browser capabilities. Treat returned data as third-party reference data and confirm final score-line or volunteer-filling decisions against official admissions sources.
+
 ## Data Flow
 
 For questions like “2025 苏州大学江苏物理类分数线是什么”:

@@ -83,4 +83,49 @@ describe("gaokao agent tool router", () => {
     expect(decision.selectedTool).toBe("explainAdmissionRisk");
     expect(decision.requiredUiComponents).toContain("admissionRiskCards");
   });
+
+  it("routes enrollment-plan questions to lookupEnrollmentPlan", () => {
+    const decision = routeAgentTurn({ userMessage: "2026 苏州大学江苏物理类招几人？学费多少？" });
+
+    expect(decision.detectedIntent).toBe("enrollment_plan_lookup");
+    expect(decision.selectedTool).toBe("lookupEnrollmentPlan");
+    expect(decision.requiredTools).toContain("lookupEnrollmentPlan");
+    expect(decision.profileSnapshot).toMatchObject({
+      province: "江苏",
+      year: 2026,
+      subjectTrack: "物理类",
+    });
+  });
+
+  it("routes admission restriction questions to lookupAdmissionRequirements", () => {
+    const decision = routeAgentTurn({ userMessage: "苏州大学计算机专业有色盲限制吗？招生章程怎么说？" });
+
+    expect(decision.detectedIntent).toBe("admission_requirements_lookup");
+    expect(decision.selectedTool).toBe("lookupAdmissionRequirements");
+    expect(decision.requiredTools).toContain("lookupAdmissionRequirements");
+  });
+
+  it("routes minimum-rank trend questions to lookupAdmissionRankTrend", () => {
+    const decision = routeAgentTurn({ userMessage: "苏州大学江苏物理类近三年最低位次趋势" });
+
+    expect(decision.detectedIntent).toBe("admission_rank_trend");
+    expect(decision.selectedTool).toBe("lookupAdmissionRankTrend");
+    expect(decision.requiredTools).toContain("lookupAdmissionRankTrend");
+    expect(decision.scoreLineLookup).toMatchObject({
+      schoolName: "苏州大学",
+      province: "江苏",
+      subjectTrack: "物理类",
+      yearRange: [2023, 2024, 2025],
+    });
+  });
+
+  it("routes volunteer-list validation requests to validateVolunteerList", () => {
+    const decision = routeAgentTurn({
+      userMessage: "我是江苏物理类 590 分，帮我检查这份志愿表：苏州大学、江苏大学、南通大学。",
+    });
+
+    expect(decision.detectedIntent).toBe("volunteer_list_validation");
+    expect(decision.selectedTool).toBe("validateVolunteerList");
+    expect(decision.requiredTools).toContain("validateVolunteerList");
+  });
 });

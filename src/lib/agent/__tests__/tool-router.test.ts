@@ -43,6 +43,32 @@ describe("gaokao agent tool router", () => {
     });
   });
 
+  it("extracts exam province from compact score phrasing", () => {
+    const patch = extractStudentProfilePatch("海南考了610，帮我看看位次和学校");
+    const decision = routeAgentTurn({ userMessage: "海南考了610，帮我看看位次和学校" });
+
+    expect(patch).toMatchObject({
+      province: "海南",
+      score: 610,
+    });
+    expect(decision.profileSnapshot).toMatchObject({
+      province: "海南",
+      subjectTrack: "综合改革",
+      score: 610,
+    });
+  });
+
+  it("extracts province from assistant-style rank result text", () => {
+    const patch = extractStudentProfilePatch("海南2025年 610分 → 参考位次约10420名");
+
+    expect(patch).toMatchObject({
+      province: "海南",
+      year: 2025,
+      score: 610,
+      rank: 10420,
+    });
+  });
+
   it("extracts profile and schedules rank hydration before volunteer planning", () => {
     const patch = extractStudentProfilePatch("我是江苏物理类 590 分，想去南京，帮我做志愿方案。");
     const decision = routeAgentTurn({ userMessage: "我是江苏物理类 590 分，想去南京，帮我做志愿方案。" });

@@ -1352,7 +1352,7 @@ const runtime = new CopilotRuntime({
     default: new BuiltInAgent({
       model: deepseek.chat(process.env.DEEPSEEK_MODEL || "deepseek-chat"),
       prompt: buildAdvisorPromptCompact(),
-      maxSteps: 4,
+      maxSteps: 12,
       tools: [
         lookupAdmissionScores,
         lookupRankByScore,

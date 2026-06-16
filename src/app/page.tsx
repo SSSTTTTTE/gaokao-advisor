@@ -12,11 +12,14 @@ import {
 import {
   AcademicCapIcon,
   AdjustmentsHorizontalIcon,
+  ArrowRightIcon,
   ArrowDownTrayIcon,
   BookOpenIcon,
   BuildingLibraryIcon,
+  ChartBarIcon,
   CheckBadgeIcon,
   CpuChipIcon,
+  InformationCircleIcon,
   MapPinIcon,
   PaperAirplaneIcon,
   PencilSquareIcon,
@@ -61,6 +64,9 @@ const COPILOT_SEND_BUTTON_SELECTOR = '[data-testid="copilot-send-button"]';
 const CURRENT_AGENT_DATE = "2026-06-13";
 const GAOKAO_STAGE_CONTEXT =
   "当前日期是 2026-06-13，时区 Asia/Shanghai。2026 年全国统考已于 2026-06-07 至 2026-06-08 举行；新高考地区可能延续到 2026-06-09 或 2026-06-10。现在应按高考后查分/志愿准备阶段处理，具体省份安排以省考试院为准。";
+const UNDERGRADUATE_LINES_2025: Record<string, number> = {
+  海南: 508,
+};
 
 const installBoundFetchShim = () => {
   if (typeof window === "undefined") return;
@@ -122,6 +128,7 @@ const studentProfileSchema = z.object({
   year: z.number().optional().describe("高考年份或参考年份"),
   subjectTrack: z.string().optional().describe("科类或选科"),
   score: z.number().optional().describe("高考分数"),
+  fullScore: z.number().optional().describe("高考满分"),
   rank: z.number().optional().describe("位次"),
   targetCities: z.array(z.string()).optional().describe("目标城市/地区"),
   preferredMajors: z.array(z.string()).optional().describe("偏好的专业方向"),
@@ -250,6 +257,23 @@ type TurnContext = {
   updatedAt: string;
 };
 
+type ProfileConfirmationSource = "user_prompt" | "remote_preprocess" | "rank_hydration" | "assistant_sync";
+
+type PendingProfileConfirmation = {
+  id: string;
+  sessionId: string;
+  source: ProfileConfirmationSource;
+  sourcePrompt: string;
+  proposedPatch: Partial<StudentProfile>;
+  derivedPatch: Partial<StudentProfile>;
+  currentProfile: StudentProfile;
+  nextProfilePreview: StudentProfile;
+  pendingTurnContext?: TurnContext;
+  editableKeys: Array<keyof StudentProfile>;
+  runAgentAfterConfirm?: boolean;
+  rankMeta?: RankMeta;
+};
+
 type PreprocessResponse = {
   keyFacts?: string[];
   profilePatch?: Partial<StudentProfile>;
@@ -366,6 +390,233 @@ function formatScore(score: number | null | undefined) {
   return score.toLocaleString("zh-CN");
 }
 
+/** 各省份高考满分映射；未收录的省份默认 750 */
+const PROVINCE_FULL_SCORE: Record<string, number> = {
+  海南: 900,
+  上海: 660,
+  江苏: 750, // 2021 起已回归 750
+};
+
+function getFullScore(province?: string, fullScore?: number): number {
+  if (typeof fullScore === "number" && Number.isFinite(fullScore) && fullScore > 0) return fullScore;
+  if (!province) return 750;
+  return PROVINCE_FULL_SCORE[province] ?? 750;
+}
+
+function getProfileFullScore(profile: StudentProfile | undefined): number {
+  return getFullScore(profile?.province, profile?.fullScore);
+}
+
+const PROFILE_CONFIRM_FIELD_LABELS: Partial<Record<keyof StudentProfile, string>> = {
+  province: "高考省份",
+  year: "年份",
+  subjectTrack: "科类",
+  score: "高考分数",
+  fullScore: "满分",
+  rank: "位次",
+  familyBudget: "预算",
+  budget: "预算",
+  cityPreference: "城市/地区",
+  canLeaveProvince: "能否出省",
+  graduatePlan: "升学倾向",
+  majorPreference: "专业偏好",
+  avoidMajors: "避开专业",
+  familyType: "家庭情况",
+};
+
+const PROFILE_CONFIRM_EDIT_KEYS: Array<keyof StudentProfile> = [
+  "province",
+  "subjectTrack",
+  "score",
+  "fullScore",
+  "rank",
+  "budget",
+  "cityPreference",
+  "canLeaveProvince",
+  "graduatePlan",
+  "majorPreference",
+  "avoidMajors",
+];
+
+const PROFILE_CONFIRM_IGNORED_KEYS = new Set<keyof StudentProfile>(["updatedAt"]);
+
+function normalizeProfileConfirmValue(value: unknown) {
+  if (Array.isArray(value)) return value.join("、");
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (value === undefined || value === null || value === "") return "待补";
+  return String(value);
+}
+
+function isMeaningfulPatchValue(value: unknown) {
+  if (value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  return value !== "";
+}
+
+function profileValueEquals(a: unknown, b: unknown) {
+  return normalizeProfileConfirmValue(a) === normalizeProfileConfirmValue(b);
+}
+
+function getChangedProfileKeys(
+  currentProfile: StudentProfile,
+  nextProfile: StudentProfile,
+  patch: Partial<StudentProfile>,
+) {
+  const keys = new Set<keyof StudentProfile>();
+  (Object.keys(patch) as Array<keyof StudentProfile>).forEach((key) => {
+    if (PROFILE_CONFIRM_IGNORED_KEYS.has(key)) return;
+    if (!isMeaningfulPatchValue(patch[key])) return;
+    if (!profileValueEquals(currentProfile[key], nextProfile[key])) keys.add(key);
+  });
+  return Array.from(keys);
+}
+
+function deriveProfileConfirmationPatch(
+  currentProfile: StudentProfile,
+  proposedPatch: Partial<StudentProfile>,
+) {
+  const rawNext = mergeProfile(currentProfile, proposedPatch);
+  const nextProfile = withDerivedProfile(rawNext);
+  const derivedPatch: Partial<StudentProfile> = {};
+  if (nextProfile.province && !proposedPatch.fullScore) {
+    const fullScore = getFullScore(nextProfile.province);
+    if (currentProfile.fullScore !== fullScore) derivedPatch.fullScore = fullScore;
+  }
+  if (!proposedPatch.subjectTrack && nextProfile.subjectTrack && currentProfile.subjectTrack !== nextProfile.subjectTrack) {
+    derivedPatch.subjectTrack = nextProfile.subjectTrack;
+  }
+  return derivedPatch;
+}
+
+function createProfileConfirmation({
+  sessionId,
+  source,
+  sourcePrompt,
+  currentProfile,
+  proposedPatch,
+  pendingTurnContext,
+  runAgentAfterConfirm = false,
+  rankMeta,
+}: {
+  sessionId: string;
+  source: ProfileConfirmationSource;
+  sourcePrompt: string;
+  currentProfile: StudentProfile;
+  proposedPatch: Partial<StudentProfile>;
+  pendingTurnContext?: TurnContext;
+  runAgentAfterConfirm?: boolean;
+  rankMeta?: RankMeta;
+}): PendingProfileConfirmation | null {
+  const normalizedPatch = { ...proposedPatch };
+  delete normalizedPatch.updatedAt;
+  const derivedPatch = deriveProfileConfirmationPatch(currentProfile, normalizedPatch);
+  const combinedPatch = mergeProfile(normalizedPatch as StudentProfile, derivedPatch);
+  const nextProfilePreview = withDerivedProfile(mergeProfile(currentProfile, combinedPatch));
+  const editableKeys = uniqueTextItems([
+    ...getChangedProfileKeys(currentProfile, nextProfilePreview, combinedPatch),
+    ...PROFILE_CONFIRM_EDIT_KEYS.filter((key) => key === "fullScore" && typeof combinedPatch.fullScore === "number"),
+  ].map(String)).filter((key): key is keyof StudentProfile =>
+    PROFILE_CONFIRM_EDIT_KEYS.includes(key as keyof StudentProfile),
+  );
+  if (!editableKeys.length) return null;
+  return {
+    id: `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    sessionId,
+    source,
+    sourcePrompt,
+    proposedPatch: normalizedPatch,
+    derivedPatch,
+    currentProfile,
+    nextProfilePreview,
+    pendingTurnContext,
+    editableKeys,
+    runAgentAfterConfirm,
+    rankMeta,
+  };
+}
+
+function parseProfileConfirmationValue(key: keyof StudentProfile, value: string): unknown {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (["score", "fullScore", "rank", "year"].includes(key)) {
+    const numeric = Number(trimmed.replace(/,/g, ""));
+    return Number.isFinite(numeric) ? numeric : undefined;
+  }
+  if (key === "canLeaveProvince") {
+    if (/^(是|可以|可出省|true)$/i.test(trimmed)) return true;
+    if (/^(否|不可以|不出省|false)$/i.test(trimmed)) return false;
+    return undefined;
+  }
+  if (key === "majorPreference" || key === "avoidMajors" || key === "preferredMajors" || key === "targetCities") {
+    return trimmed.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean);
+  }
+  return trimmed;
+}
+
+function patchFromConfirmedProfileForm(
+  keys: Array<keyof StudentProfile>,
+  values: Partial<Record<keyof StudentProfile, string>>,
+) {
+  const patch: Partial<StudentProfile> = {};
+  keys.forEach((key) => {
+    const parsed = parseProfileConfirmationValue(key, values[key] ?? "");
+    if (parsed !== undefined) {
+      (patch as Record<string, unknown>)[key] = parsed;
+      if (key === "budget") patch.familyBudget = String(parsed);
+      if (key === "majorPreference" && Array.isArray(parsed)) patch.preferredMajors = parsed;
+      if (key === "cityPreference") patch.targetCities = String(parsed).split(/[、,，/]/).map((item) => item.trim()).filter(Boolean);
+    }
+  });
+  if (Object.keys(patch).length) patch.updatedAt = new Date().toISOString();
+  return patch;
+}
+
+function getReferenceUndergraduateLine(province?: string, year = 2025) {
+  if (year !== 2025 || !province) return null;
+  return UNDERGRADUATE_LINES_2025[province] ?? null;
+}
+
+function easeOutCubic(value: number) {
+  return 1 - Math.pow(1 - value, 3);
+}
+
+function useAnimatedNumber(target: number | undefined | null, duration = 760) {
+  const [displayValue, setDisplayValue] = useState(() =>
+    typeof target === "number" && Number.isFinite(target) ? target : 0,
+  );
+  const previousTargetRef = useRef<number | undefined>(
+    typeof target === "number" && Number.isFinite(target) ? target : undefined,
+  );
+
+  useEffect(() => {
+    if (typeof target !== "number" || !Number.isFinite(target)) {
+      previousTargetRef.current = undefined;
+      setDisplayValue(0);
+      return undefined;
+    }
+
+    const from = previousTargetRef.current ?? 0;
+    const to = target;
+    previousTargetRef.current = target;
+    if (from === to) {
+      setDisplayValue(to);
+      return undefined;
+    }
+
+    let frame = 0;
+    const startedAt = performance.now();
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - startedAt) / duration);
+      setDisplayValue(from + (to - from) * easeOutCubic(progress));
+      if (progress < 1) frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [duration, target]);
+
+  return Math.round(displayValue);
+}
+
 function normalizeIgnoredKeys(items: Array<string | keyof StudentProfile> | undefined) {
   return normalizePriorityKeys(items);
 }
@@ -392,6 +643,48 @@ function compactProfileValue(value: unknown) {
   return "";
 }
 
+type ProfileTickerItem = {
+  label: string;
+  value: string;
+  missing?: boolean;
+};
+
+function firstProfileValue(...values: unknown[]) {
+  for (const value of values) {
+    const compact = compactProfileValue(value);
+    if (compact) return compact;
+  }
+  return "";
+}
+
+function buildProfileTickerItems(profile: StudentProfile, rankMeta?: RankMeta): ProfileTickerItem[] {
+  const fullScore = getProfileFullScore(profile);
+  const scoreValue =
+    typeof profile.score === "number" && Number.isFinite(profile.score) ? `${formatScore(profile.score)}/${fullScore}` : "";
+  const rankValue =
+    typeof profile.rank === "number" && Number.isFinite(profile.rank) && profile.rank > 0
+      ? rankMeta?.source === "auto2025"
+        ? `2025参考 ${formatRank(profile.rank)}`
+        : formatRank(profile.rank)
+      : "";
+  const budgetValue = firstProfileValue(profile.familyBudget, profile.budget);
+  const cityValue = firstProfileValue(profile.cityPreference, profile.targetCities);
+  const majorValue = firstProfileValue(profile.majorPreference, profile.preferredMajors);
+  const leaveProvinceValue =
+    typeof profile.canLeaveProvince === "boolean" ? (profile.canLeaveProvince ? "可出省" : "不想出省") : "";
+  const cityLabel = [cityValue, leaveProvinceValue].filter(Boolean).join(" · ") || "";
+
+  return [
+    { label: "高考分数", value: scoreValue || "待补", missing: !scoreValue },
+    { label: "预算", value: budgetValue || "待补", missing: !budgetValue },
+    { label: "科类", value: firstProfileValue(profile.subjectTrack) || "待补", missing: !profile.subjectTrack },
+    { label: "位次", value: rankValue || "待补", missing: !rankValue },
+    { label: "高考省份", value: firstProfileValue(profile.province) || "待补", missing: !profile.province },
+    { label: "城市/出省", value: cityLabel || "待补", missing: !cityLabel },
+    { label: "专业偏好", value: majorValue || "待补", missing: !majorValue },
+  ];
+}
+
 function asArray<T>(value: T[] | undefined | null): T[] {
   return Array.isArray(value) ? value : [];
 }
@@ -402,6 +695,7 @@ function profileLabelValue(profile: StudentProfile | undefined, key: keyof Stude
     year: "年份",
     subjectTrack: "科类",
     score: "分数",
+    fullScore: "满分",
     rank: "位次",
     targetCities: "目标城市",
     preferredMajors: "专业偏好",
@@ -500,14 +794,15 @@ const FOLLOW_UP_OPTIONS_BY_FIELD: Partial<
     { label: "预算无上限", prompt: "预算暂时不是主要限制。" },
   ],
   cityPreference: [
-    { label: "留本省", prompt: "我更想留在本省读大学。" },
+    { label: "留本省", prompt: "我更想留在本省读大学，不想出省。" },
+    { label: "可接受出省", prompt: "可以接受出省读大学，哪里合适去哪里。" },
     { label: "想去的城市/地区是：", prompt: "我想去的城市/地区是：" },
-    { label: "地区不限", prompt: "城市和地区无所谓，哪里都可以。" },
+    { label: "地区不限", prompt: "城市和地区无所谓，哪里都可以，出省也没问题。" },
   ],
   canLeaveProvince: [
-    { label: "可以接受出省", prompt: "可以接受出省读大学。" },
-    { label: "不想出省", prompt: "不想出省，优先省内。" },
-    { label: "出省无所谓", prompt: "出省无所谓，哪里合适去哪里。" },
+    { label: "留本省", prompt: "我更想留在本省读大学，不想出省。" },
+    { label: "可接受出省", prompt: "可以接受出省读大学，哪里合适去哪里。" },
+    { label: "地区不限", prompt: "城市和地区无所谓，哪里都可以，出省也没问题。" },
   ],
   graduatePlan: [
     { label: "本科就业优先", prompt: "本科后倾向直接就业。" },
@@ -573,7 +868,7 @@ function buildReportMarkdown({
     .join("\n");
 
   return [
-    "# 高考志愿填报 Agent 报告",
+    "# 升学策士报告",
     "",
     `生成时间: ${new Date().toLocaleString("zh-CN")}`,
     "",
@@ -644,8 +939,7 @@ function prioritizeMissingFields(
   }
   if (/普通家庭|家里普通|预算|中外|学费|生活费|钱/.test(text)) push("budget");
   if (/城市|地区|想去|留在|出省|新疆|南京|苏州|上海|北京|广州|深圳|杭州|成都|武汉|西安/.test(text)) {
-    push("cityPreference");
-    push("canLeaveProvince");
+    push("cityPreference"); // 城市偏好和出省合并为一个问题
   }
   if (/读研|保研|就业|本科毕业|考研/.test(text)) push("graduatePlan");
   if (/专业|方向|计算机|电子|电气|医学|师范|法学|金融/.test(text)) push("majorPreference");
@@ -696,8 +990,8 @@ function buildSuggestions(
 
   if (!ignored.has("rank") && /位次|排名|排位/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.rank);
   if (!ignored.has("budget") && /预算|学费|生活费|中外合作|费用/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.budget);
-  if (!ignored.has("cityPreference") && /城市|地区|想去|哪里读|省份/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.cityPreference);
-  if (!ignored.has("canLeaveProvince") && /出省|外省|省内/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.canLeaveProvince);
+  // 城市偏好和出省合并为一个提示
+  if (!ignored.has("cityPreference") && /城市|地区|想去|哪里读|省份|出省|外省|省内/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.cityPreference);
   if (!ignored.has("graduatePlan") && /读研|保研|就业/.test(lastAssistantText)) pushMany(SUGGESTION_TEMPLATE_BY_FIELD.graduatePlan);
 
   if (!ignored.has("rank") && !profile?.rank && profile?.score) suggestions.unshift("我的位次是：");
@@ -754,6 +1048,52 @@ function buildLocalTurnContext({
   };
 }
 
+function buildConfirmedTurnContext({
+  prompt,
+  confirmedPatch,
+  confirmedProfile,
+  previousSummary,
+  lastAssistantText,
+  previousMissingPriority = [],
+}: {
+  prompt: string;
+  confirmedPatch: Partial<StudentProfile>;
+  confirmedProfile: StudentProfile;
+  previousSummary: string;
+  lastAssistantText: string;
+  previousMissingPriority?: Array<keyof StudentProfile>;
+}): TurnContext {
+  const toolRoute = routeAgentTurn({
+    userMessage: prompt,
+    profile: confirmedProfile as AgentStudentProfile,
+    trustProfile: true,
+  });
+  const keyFacts = buildKeyFacts(confirmedPatch, prompt);
+  const missingPriority = prioritizeMissingFields(
+    confirmedProfile,
+    prompt,
+    previousMissingPriority,
+  );
+  const sessionSummary = compactSessionSummary(previousSummary, prompt, keyFacts);
+  const suggestions = buildSuggestions(confirmedProfile, missingPriority, lastAssistantText);
+  return {
+    rawPrompt: prompt,
+    keyFacts,
+    profilePatch: confirmedPatch,
+    profileAfterTurn: confirmedProfile,
+    toolRoute: {
+      ...toolRoute,
+      profilePatch: confirmedPatch as Partial<AgentStudentProfile>,
+      profileSnapshot: confirmedProfile as AgentStudentProfile,
+    },
+    missingPriority,
+    sessionSummary,
+    suggestions,
+    ambiguityWarnings: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function shouldUseRemotePreprocess(prompt: string) {
   const compact = prompt.replace(/\s+/g, "");
   const provinceHits = PROVINCE_CANDIDATES.filter((item) => compact.includes(item)).length;
@@ -768,6 +1108,16 @@ function readLastAssistantText() {
   if (typeof document === "undefined") return "";
   const messages = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"]'));
   return messages.at(-1)?.innerText.trim() ?? "";
+}
+
+function readRecentAssistantTexts(limit = 6) {
+  if (typeof document === "undefined") return [];
+  const messages = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"]'));
+  return messages
+    .slice(-limit)
+    .reverse()
+    .map((message) => message.innerText.trim())
+    .filter(Boolean);
 }
 
 async function requestRemotePreprocess({
@@ -1438,16 +1788,18 @@ function FollowUpQuestionOptions({
     const assistantMessages = Array.from(
       document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage'),
     );
-    const parent =
-      marker.closest<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage') ??
-      assistantMessages.at(-1) ??
-      marker.parentElement;
-    if (!parent) return;
+    // 始终使用最新的 assistant message 作为问题卡片的容器
+    const latestMessage = assistantMessages.at(-1);
+    if (!latestMessage) return;
+
+    // 清理旧消息中的问题卡片
     assistantMessages.slice(0, -1).forEach((message) => {
-      message.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+      message.querySelectorAll(".gaokao-inline-followup-options, .gaokao-followup-options").forEach((node) => node.remove());
     });
 
-    parent.querySelectorAll(`[data-followup-instance="${instanceIdRef.current}"]`).forEach((node) => node.remove());
+    // 移除之前创建的同实例问题卡片，以及 hook 创建的卡片（避免重复）
+    latestMessage.querySelectorAll(`[data-followup-instance="${instanceIdRef.current}"]`).forEach((node) => node.remove());
+    latestMessage.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
 
     const container = document.createElement("div");
     container.className = "gaokao-followup-options my-3 grid gap-3";
@@ -1482,6 +1834,14 @@ function FollowUpQuestionOptions({
           }
           applyFollowUpButtonState(button, true);
           onSelect(prompt);
+          // 用户选择选项后，移除当前的问题卡片
+          const container = button.closest<HTMLElement>(".gaokao-followup-options, .gaokao-inline-followup-options");
+          if (container) {
+            container.style.opacity = "0";
+            container.style.transform = "translateY(-8px)";
+            container.style.transition = "opacity 0.2s ease, transform 0.2s ease";
+            window.setTimeout(() => container.remove(), 200);
+          }
         });
         row.append(button);
       });
@@ -1492,8 +1852,37 @@ function FollowUpQuestionOptions({
       container.append(group);
     });
 
-    parent.append(container);
-    return undefined;
+    // 将问题卡片追加到消息；CSS flexbox order 确保卡片始终在消息最下方
+    latestMessage.append(container);
+
+    // 后备：用 MutationObserver 确保卡片始终在消息末尾（应对 React 重新渲染覆盖 CSS order）
+    const ensureAtBottom = () => {
+      const msgs = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage'));
+      const msg = msgs.at(-1);
+      if (!msg) return;
+      // 将所有问题卡片（包括嵌套在 wrapper 里的）移到消息容器末尾
+      msg.querySelectorAll<HTMLElement>(".gaokao-followup-options, .gaokao-inline-followup-options, [data-followup-instance], [data-gaokao-inline-followup]").forEach((node) => {
+        if (node.parentElement !== msg) {
+          msg.append(node);
+        } else {
+          // 已经是直接子元素，检查是否在最后
+          const lastChild = msg.lastElementChild;
+          if (lastChild && lastChild !== node) {
+            msg.append(node);
+          }
+        }
+      });
+    };
+    // 立即检查一次
+    ensureAtBottom();
+    // 定期检查（覆盖 React 重新渲染）
+    const timers = [100, 300, 600, 1000].map((d) => window.setTimeout(ensureAtBottom, d));
+    const observer = new MutationObserver(ensureAtBottom);
+    observer.observe(latestMessage, { childList: true, subtree: true });
+    return () => {
+      timers.forEach((t) => window.clearTimeout(t));
+      observer.disconnect();
+    };
   }, [onDeselect, onSelect, questions]);
 
   return <span ref={markerRef} className="gaokao-followup-options-marker hidden" />;
@@ -2536,12 +2925,45 @@ function buildInlineFollowUpQuestions(
     questions.push({ field, question });
   };
 
-  if (/位次|排名|排位|全省/.test(text)) push("rank", "你的全省位次查到了吗？");
-  if (/预算|学费|生活费|中外合作|费用/.test(text)) push("budget", "家里每年预算大概能接受多少？");
-  if (/城市|地区|想去|哪里读|留在/.test(text)) push("cityPreference", "你更想去哪个城市或地区？");
-  if (/出省|外省|省内/.test(text)) push("canLeaveProvince", "能接受出省读大学吗？");
-  if (/专升本|升本|读研|保研|就业|本科毕业|毕业后/.test(text)) push("graduatePlan", "毕业后更倾向直接就业、升学，还是还不确定？");
-  if (/专业|方向|计算机|电气|机械|医学|师范/.test(text)) push("majorPreference", "专业方向能再具体一点吗？");
+  const mapQuestionToFields = (questionText: string) => {
+    const normalized = questionText.replace(/\s+/g, "");
+    const fields: Array<{ field: keyof StudentProfile; question: string }> = [];
+
+    if (/位次|排名|排位|全省/.test(normalized)) {
+      fields.push({ field: "rank", question: "你的全省位次查到了吗？" });
+    }
+    if (/预算|学费|生活费|中外合作|费用|多少钱|多少/.test(normalized)) {
+      fields.push({ field: "budget", question: "家里每年预算大概能接受多少？" });
+    }
+    if (/城市|地区|想去|哪里读|留在|留本省|留海南|广东|江浙沪/.test(normalized)) {
+      fields.push({ field: "cityPreference", question: "想去哪个城市/地区？" });
+    }
+    if (/出省|外省|省内|本省/.test(normalized)) {
+      fields.push({ field: "canLeaveProvince", question: "能接受出省读大学吗？" });
+    }
+    if (/专升本|升本|读研|保研|就业|本科毕业|毕业后/.test(normalized)) {
+      fields.push({ field: "graduatePlan", question: "毕业后更倾向直接就业、升学，还是还不确定？" });
+    }
+    if (/专业|方向|计算机|软件|人工智能|电气|电子|机械|医学|师范|法学|会计|汉语言/.test(normalized)) {
+      fields.push({ field: "majorPreference", question: "专业方向能再具体一点吗？" });
+    }
+
+    return fields;
+  };
+
+  const explicitQuestionTexts = text
+    .split(/(?:\n+|[？?])/)
+    .map((line) => line.replace(/^[\s>*\-•\d.、，,：:]+/, "").trim())
+    .filter((line) => line.length >= 3)
+    .filter((line) => /想去|能接受|毕业后|读研|就业|专业|方向|预算|学费|位次|排名|城市|地区|出省|省内|有没有|多少|哪/.test(line));
+
+  explicitQuestionTexts.forEach((questionText) => {
+    mapQuestionToFields(questionText).forEach(({ field, question }) => push(field, question));
+  });
+
+  if (!questions.length) {
+    mapQuestionToFields(text).forEach(({ field, question }) => push(field, question));
+  }
 
   return dedupeFollowUpQuestions(questions.map((question) => ({
     ...question,
@@ -2552,7 +2974,7 @@ function buildInlineFollowUpQuestions(
           { label: "还没想好", prompt: "毕业后就业还是专升本还没想好。" },
         ]
       : FOLLOW_UP_OPTIONS_BY_FIELD[question.field] ?? [],
-  }))).slice(0, 4);
+  }))).slice(0, 5);
 }
 
 function normalizeFollowUpField(field: string | undefined, question = "") {
@@ -2640,31 +3062,40 @@ function useInlineFollowUpOptions({
     if (typeof document === "undefined") return;
 
     let frame = 0;
+    let suppressEnhance = false; // 用户选择选项后阻止重新创建问题卡片
     const timers = new Set<number>();
     const clearTimers = () => {
       timers.forEach((timerId) => window.clearTimeout(timerId));
       timers.clear();
     };
     const enhance = () => {
+      // 如果用户已经选择了选项，阻止重新创建问题卡片
+      if (suppressEnhance) return;
       if (frame) window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
+        // 再次检查 suppressEnhance 标志
+        if (suppressEnhance) return;
         const messages = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="copilot-assistant-message"], .copilotKitAssistantMessage'));
         const latestMessage = messages.at(-1);
         messages.slice(0, -1).forEach((message) => {
-          message.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
+          message.querySelectorAll(".gaokao-inline-followup-options, .gaokao-followup-options").forEach((node) => node.remove());
         });
         if (!latestMessage) return;
-        const existingFollowUps = Array.from(
-          latestMessage.querySelectorAll<HTMLElement>(".gaokao-followup-options"),
-        );
-        if (existingFollowUps.length) {
-          existingFollowUps.forEach((node) => latestMessage.append(node));
-          return;
-        }
+
+        // 将所有问题卡片（包括嵌套在 wrapper 里的）移到消息容器末尾
+        latestMessage.querySelectorAll<HTMLElement>(".gaokao-followup-options, .gaokao-inline-followup-options, [data-followup-instance], [data-gaokao-inline-followup]").forEach((node) => {
+          latestMessage.append(node);
+        });
+
+        // 检查是否有正在运行的工具调用
         if (latestMessage.querySelector('[data-gaokao-running="true"]')) return;
+
+        // 检查是否已经有问题卡片了（包括组件渲染的和 hook 创建的）
+        const hasAnyFollowUpCards = latestMessage.querySelector(".gaokao-followup-options, .gaokao-inline-followup-options, [data-followup-instance], [data-gaokao-inline-followup]");
+        if (hasAnyFollowUpCards) return;
+
         const text = latestMessage.innerText.trim();
         const questions = buildInlineFollowUpQuestions(text, profile, ignoredFields);
-        latestMessage.querySelectorAll(".gaokao-inline-followup-options").forEach((node) => node.remove());
         if (!questions.length) return;
         const container = document.createElement("div");
         container.className = "gaokao-inline-followup-options mt-3 grid gap-2";
@@ -2692,12 +3123,21 @@ function useInlineFollowUpOptions({
               if (button.dataset.selected === "true") {
                 applyFollowUpButtonState(button, false);
                 onDeselect(prompt);
-                timers.add(window.setTimeout(enhance, 80));
                 return;
               }
               applyFollowUpButtonState(button, true);
               onSelect(prompt);
-              timers.add(window.setTimeout(enhance, 80));
+              // 用户选择选项后，清除定时器并阻止重新创建问题卡片
+              clearTimers();
+              suppressEnhance = true;
+              // 移除当前的问题卡片
+              const clickedContainer = button.closest<HTMLElement>(".gaokao-inline-followup-options, .gaokao-followup-options");
+              if (clickedContainer) {
+                clickedContainer.style.opacity = "0";
+                clickedContainer.style.transform = "translateY(-8px)";
+                clickedContainer.style.transition = "opacity 0.2s ease, transform 0.2s ease";
+                window.setTimeout(() => clickedContainer.remove(), 200);
+              }
             });
             buttonRow.append(button);
           });
@@ -2709,6 +3149,8 @@ function useInlineFollowUpOptions({
       });
     };
     const scheduleEnhance = () => {
+      // 当 DOM 变化（如新消息到达）时，重置 suppressEnhance 标志
+      suppressEnhance = false;
       clearTimers();
       [250, 1100, 2200].forEach((delay) => {
         const timerId = window.setTimeout(enhance, delay);
@@ -2785,33 +3227,52 @@ function buildSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
   return `查看${schoolName}近三年${scope ? `在${scope}` : ""}录取分数线趋势，并绘制曲线。`;
 }
 
-function submitSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
-  const prompt = buildSchoolTrendPrompt(schoolName, profile);
-  insertPrompt(prompt);
-  window.setTimeout(() => submitHiddenCopilotPrompt(prompt), 80);
+let lastDirectSchoolTrendSubmit: { prompt: string; submittedAt: number } | null = null;
+
+function scrollGaokaoChatToBottom(behavior: ScrollBehavior = "smooth") {
+  const scrollRoot = document.querySelector<HTMLElement>(".gaokao-dashboard-scroll");
+  if (!scrollRoot) return;
+  scrollRoot.scrollTo({
+    top: scrollRoot.scrollHeight,
+    behavior,
+  });
 }
 
-function submitHiddenCopilotPrompt(message: string) {
-  syncHiddenCopilotPrompt(message, true);
+function submitSchoolTrendPrompt(schoolName: string, profile?: StudentProfile) {
+  const prompt = buildSchoolTrendPrompt(schoolName, profile);
+  const now = Date.now();
+  if (lastDirectSchoolTrendSubmit?.prompt === prompt && now - lastDirectSchoolTrendSubmit.submittedAt < 1500) {
+    scrollGaokaoChatToBottom();
+    return;
+  }
+  lastDirectSchoolTrendSubmit = { prompt, submittedAt: now };
+  scrollGaokaoChatToBottom();
+  window.setTimeout(() => submitHiddenCopilotPrompt(prompt, { focusHidden: false }), 80);
+}
+
+function submitHiddenCopilotPrompt(message: string, options: { focusHidden?: boolean } = {}) {
+  const focusHidden = options.focusHidden ?? true;
+  syncHiddenCopilotPrompt(message, focusHidden);
   let attempts = 0;
   const trySend = () => {
     const { sendButton, textarea } = getCopilotChatInputElements();
     if (!sendButton || !textarea || !textarea.value.trim()) {
       if (attempts++ < 20) {
-        syncHiddenCopilotPrompt(message, true);
+        syncHiddenCopilotPrompt(message, focusHidden);
         window.setTimeout(trySend, 60);
       }
       return;
     }
     if (sendButton.disabled) {
       if (attempts++ < 20) {
-        syncHiddenCopilotPrompt(message, true);
+        syncHiddenCopilotPrompt(message, focusHidden);
         window.setTimeout(trySend, 60);
       }
       return;
     }
-    syncHiddenCopilotPrompt(message, true);
+    syncHiddenCopilotPrompt(message, focusHidden);
     sendButton.click();
+    window.setTimeout(() => scrollGaokaoChatToBottom("auto"), 120);
   };
   window.setTimeout(trySend, 50);
 }
@@ -3017,13 +3478,13 @@ function AppHeader({
   return (
     <header className="px-4 pb-3 pt-4">
       <div className="flex items-center gap-3">
-        <div className="flex h-[52px] w-[52px] shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-500/25">
-          <AcademicCapIcon className="h-8 w-8" />
+        <div className="flex h-[52px] w-[52px] shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-[#334258] shadow-lg shadow-slate-500/20">
+          <img src="/images/feisheng-logo.png" alt="飞升私塾" className="h-full w-full object-cover" />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h1 className="truncate text-[22px] font-black leading-7 tracking-normal text-slate-950">
-              高考志愿填报 Agent
+              升学策士
             </h1>
             <span className="rounded-lg bg-blue-100 px-2 py-0.5 text-xs font-black text-blue-700">AI</span>
           </div>
@@ -3064,6 +3525,7 @@ function CandidateProfileCard({
   rankMeta,
   strategySummary,
   onToggleCollapsed,
+  onExpandCollapsed,
   onIgnoreMissing,
   onRestoreMissing,
 }: {
@@ -3076,39 +3538,125 @@ function CandidateProfileCard({
   rankMeta?: RankMeta;
   strategySummary: ReturnType<typeof buildStrategySummary>;
   onToggleCollapsed: () => void;
+  onExpandCollapsed: () => void;
   onIgnoreMissing: () => void;
   onRestoreMissing: () => void;
 }) {
-  const rankValue = formatRank(profile.rank);
-  const rankLabel = profile.rank
-    ? rankMeta?.source === "auto2025"
-      ? `2025参考：${rankValue}`
-      : `位次：${rankValue}`
-    : "位次待补";
+  const animatedScore = useAnimatedNumber(profile.score, 820);
+  const animatedRank = useAnimatedNumber(profile.rank, 880);
+  const animatedCompletion = useAnimatedNumber(completion, 720);
+  const [isProfileUpdated, setIsProfileUpdated] = useState(false);
+  const previousSnapshotRef = useRef({
+    score: profile.score,
+    rank: profile.rank,
+    completion,
+  });
+  const hasRank = typeof profile.rank === "number" && Number.isFinite(profile.rank) && profile.rank > 0;
+  const rankLabel = hasRank ? formatRank(animatedRank) : "位次待补";
+  const rankSourceLabel = hasRank && rankMeta?.source === "auto2025" ? "数据:2025" : "";
+  const scoreLabel =
+    typeof profile.score === "number" && Number.isFinite(profile.score) ? formatScore(animatedScore) : "--";
+
+  useEffect(() => {
+    const previous = previousSnapshotRef.current;
+    const changed =
+      previous.score !== profile.score ||
+      previous.rank !== profile.rank ||
+      previous.completion !== completion;
+    previousSnapshotRef.current = {
+      score: profile.score,
+      rank: profile.rank,
+      completion,
+    };
+    if (!changed) return undefined;
+
+    const hasNewUsefulValue =
+      typeof profile.score === "number" ||
+      typeof profile.rank === "number" ||
+      completion > previous.completion;
+    if (!hasNewUsefulValue) return undefined;
+
+    setIsProfileUpdated(false);
+    const start = window.setTimeout(() => setIsProfileUpdated(true), 20);
+    const stop = window.setTimeout(() => setIsProfileUpdated(false), 980);
+    return () => {
+      window.clearTimeout(start);
+      window.clearTimeout(stop);
+    };
+  }, [completion, profile.rank, profile.score]);
 
   if (isCollapsed) {
+    const compactActionLabel = missingCount ? "生成方案" : ignoredCount ? "恢复待补" : "生成方案";
+    const handleCompactAction = missingCount ? onIgnoreMissing : ignoredCount ? onRestoreMissing : undefined;
+    const undergraduateLine = getReferenceUndergraduateLine(profile.province, 2025);
+    const overLine =
+      typeof profile.score === "number" && undergraduateLine
+        ? Math.max(0, Math.round(profile.score - undergraduateLine))
+        : null;
+    const provinceLabel = getProfileValue(profile, "province", "省份待补");
+    const rankYearLabel = rankSourceLabel ? "2025参考" : "位次待补";
+
     return (
-      <section className="mx-4 rounded-[22px] border border-blue-100 bg-white px-4 py-3 shadow-[0_14px_32px_rgba(15,23,42,0.07)]">
-        <div className="flex items-center gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-black leading-none text-blue-600">{formatScore(profile.score)}</span>
-              <span className="text-xs font-black text-slate-500">分</span>
-              <span className="truncate text-sm font-bold text-slate-700">{rankLabel}</span>
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <span className="text-xs font-bold text-slate-500">完整度 {completion}%</span>
-              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
-                <div className="h-full rounded-full bg-blue-600" style={{ width: `${completion}%` }} />
-              </div>
+      <section
+        className={`gaokao-profile-card gaokao-profile-card-compact gaokao-sticky-summary cursor-pointer ${isProfileUpdated ? "gaokao-profile-flash" : ""}`}
+        onClick={onExpandCollapsed}
+        aria-label="已折叠的考生画像，点击展开"
+      >
+        <div className="gaokao-sticky-summary-icon-area" aria-hidden="true">
+          <div className="gaokao-sticky-summary-icon">
+            <ChartBarIcon className="h-7 w-7" />
+          </div>
+        </div>
+        <div className="gaokao-sticky-summary-score-area">
+          <p className="gaokao-sticky-summary-title">我的成绩</p>
+          <div className="gaokao-sticky-summary-score">
+            <span className="gaokao-score-roll">{scoreLabel}</span>
+            <span className="gaokao-sticky-summary-full-score">/{getProfileFullScore(profile)}</span>
+          </div>
+          <div className="gaokao-sticky-summary-badge">
+            <ArrowRightIcon className="h-4 w-4 -rotate-45" />
+            <span>{overLine !== null ? `超本科线 ${overLine} 分` : "本科线待定"}</span>
+          </div>
+        </div>
+        <div className="gaokao-sticky-summary-divider" aria-hidden="true" />
+        <div className="gaokao-sticky-summary-info-area">
+          <div className="gaokao-sticky-summary-info-row">
+            <MapPinIcon className="h-4 w-4" />
+            <span>{provinceLabel}</span>
+            <span>·</span>
+            <span>{rankYearLabel}</span>
+          </div>
+          <div className="gaokao-sticky-summary-info-row">
+            <TrophyIcon className="h-4 w-4" />
+            <span>参考位次</span>
+            <strong className="gaokao-rank-roll">{rankLabel}</strong>
+          </div>
+          <div className="gaokao-sticky-summary-dashed" aria-hidden="true" />
+          <div className="gaokao-sticky-summary-progress-row">
+            <span>资料完整度</span>
+            <InformationCircleIcon className="h-4 w-4 text-slate-400" />
+            <strong>{animatedCompletion}%</strong>
+            <div className="gaokao-sticky-summary-progress-track">
+              <div
+                key={`compact-progress-${completion}`}
+                className="gaokao-profile-progress gaokao-sticky-summary-progress-fill"
+                style={{ width: `${animatedCompletion}%` }}
+              />
             </div>
           </div>
+        </div>
+        <div className="gaokao-sticky-summary-action-area">
           <button
             type="button"
-            onClick={onToggleCollapsed}
-            className="h-10 shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3 text-xs font-black text-blue-700"
+            onClick={(event) => {
+              event.stopPropagation();
+              if (handleCompactAction) handleCompactAction();
+              else onIgnoreMissing();
+            }}
+            className="gaokao-sticky-summary-action-button"
           >
-            展开画像
+            <span>{compactActionLabel}</span>
+            <ArrowRightIcon className="h-4 w-4" />
           </button>
         </div>
       </section>
@@ -3143,7 +3691,7 @@ function CandidateProfileCard({
     "当前画像仍在收集中，建议先补齐关键项；也可以忽略待补信息，直接生成一版初步意见摘要。";
 
   return (
-    <section className="mx-4 rounded-[22px] border border-blue-100 bg-white p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)]">
+    <section className={`gaokao-profile-card mx-4 rounded-[22px] border border-blue-100 bg-white p-4 shadow-[0_18px_45px_rgba(15,23,42,0.08)] ${isProfileUpdated ? "gaokao-profile-flash" : ""}`}>
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <h2 className="text-[19px] font-black text-slate-950">考生画像</h2>
@@ -3162,30 +3710,37 @@ function CandidateProfileCard({
       </div>
       <div className="mt-3 flex items-center gap-3">
         <span className="text-sm font-semibold text-slate-500">信息完整度</span>
-        <span className="text-sm font-black text-blue-700">{completion}%</span>
+        <span className="text-sm font-black text-blue-700">{animatedCompletion}%</span>
         <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
-          <div className="h-full rounded-full bg-blue-600" style={{ width: `${completion}%` }} />
+          <div
+            key={`profile-progress-${completion}`}
+            className="gaokao-profile-progress h-full rounded-full bg-blue-600"
+            style={{ width: `${animatedCompletion}%` }}
+          />
         </div>
       </div>
-      <div className="mt-5 grid grid-cols-[1fr_auto] items-end gap-3">
-        <div>
-          <p className="text-[54px] font-black leading-none text-blue-600">{formatScore(profile.score)}</p>
-          <p className="mt-1 text-sm font-bold text-slate-950">
-            {profile.score ? "分" : "分数待补"}
-            <span className="ml-2 text-slate-400">/ 750</span>
-          </p>
-        </div>
-        <div className="flex flex-col items-end gap-2">
-          <span className="rounded-xl bg-blue-50 px-3 py-1.5 text-sm font-black text-blue-700">
+      <div className="mt-5 grid gap-3">
+        <div className="flex items-end justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[13px] font-black text-slate-500">分数</p>
+            <p className="mt-1 leading-none">
+              <span className="gaokao-score-roll text-[54px] font-black leading-none text-blue-600">{scoreLabel}</span>
+              <span className="ml-1 text-2xl font-black text-slate-400">/{getProfileFullScore(profile)}</span>
+            </p>
+            <p className="mt-1 text-sm font-bold text-slate-950">{profile.score ? "高考分数" : "分数待补"}</p>
+          </div>
+          <span className="mb-2 shrink-0 rounded-xl bg-blue-50 px-3 py-1.5 text-sm font-black text-blue-700">
             {getProfileValue(profile, "province", "省份待补")}考生
           </span>
-          <span
-            className={`rounded-xl px-3 py-1.5 text-sm font-black ${
-              profile.rank ? "bg-blue-50 text-blue-700" : "bg-red-50 text-red-600"
-            }`}
-          >
-            {rankLabel}
-          </span>
+        </div>
+        <div className="w-fit rounded-2xl border border-blue-50 bg-slate-50 px-4 py-3">
+          <p className="text-[12px] font-black text-slate-500">位次</p>
+          <div className="mt-1 flex items-baseline gap-1.5">
+            <span className={`gaokao-rank-roll text-2xl font-black ${hasRank ? "text-slate-950" : "text-red-500"}`}>
+              {rankLabel}
+            </span>
+            {rankSourceLabel ? <span className="text-[10px] font-bold text-slate-400">{rankSourceLabel}</span> : null}
+          </div>
         </div>
       </div>
       <div className="mt-4 grid grid-cols-2 gap-x-3 gap-y-3 rounded-2xl border border-blue-50 bg-white/80 p-3">
@@ -3288,6 +3843,131 @@ function CandidateProfileCard({
   );
 }
 
+function ProfileConfirmationModal({
+  pending,
+  onConfirm,
+  onCancel,
+}: {
+  pending: PendingProfileConfirmation;
+  onConfirm: (patch: Partial<StudentProfile>) => void;
+  onCancel: () => void;
+}) {
+  const [values, setValues] = useState<Partial<Record<keyof StudentProfile, string>>>(() => {
+    const initial: Partial<Record<keyof StudentProfile, string>> = {};
+    pending.editableKeys.forEach((key) => {
+      initial[key] = normalizeProfileConfirmValue(pending.nextProfilePreview[key]) === "待补"
+        ? ""
+        : normalizeProfileConfirmValue(pending.nextProfilePreview[key]);
+    });
+    return initial;
+  });
+
+  useEffect(() => {
+    const next: Partial<Record<keyof StudentProfile, string>> = {};
+    pending.editableKeys.forEach((key) => {
+      next[key] = normalizeProfileConfirmValue(pending.nextProfilePreview[key]) === "待补"
+        ? ""
+        : normalizeProfileConfirmValue(pending.nextProfilePreview[key]);
+    });
+    setValues(next);
+  }, [pending]);
+
+  const sourceLabel =
+    pending.source === "rank_hydration"
+      ? "位次自动补全"
+      : pending.source === "assistant_sync"
+        ? "助手回复同步"
+        : pending.source === "remote_preprocess"
+          ? "画像子 agent"
+          : "用户输入";
+
+  return (
+    <div className="gaokao-profile-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="profile-confirm-title">
+      <div className="gaokao-profile-confirm-modal">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-black text-blue-700">{sourceLabel}</p>
+            <h2 id="profile-confirm-title" className="mt-1 text-xl font-black text-slate-950">
+              确认更新考生画像
+            </h2>
+            <p className="mt-1 text-sm leading-5 text-slate-500">
+              主 agent 会以这里确认后的画像为准；如果和原话不一致，也按确认画像分析。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-9 shrink-0 rounded-full border border-slate-200 bg-white px-3 text-xs font-black text-slate-500"
+          >
+            取消
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3">
+          {pending.editableKeys.map((key) => {
+            const oldValue = normalizeProfileConfirmValue(pending.currentProfile[key]);
+            const label = PROFILE_CONFIRM_FIELD_LABELS[key] ?? String(key);
+            const isDerived = pending.derivedPatch[key] !== undefined && pending.proposedPatch[key] === undefined;
+            return (
+              <label key={key} className="gaokao-profile-confirm-row">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-black text-slate-900">{label}</span>
+                    {isDerived ? (
+                      <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-black text-blue-700">
+                        系统推导
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="mt-1 truncate text-xs font-semibold text-slate-400">原值：{oldValue}</p>
+                </div>
+                {key === "canLeaveProvince" ? (
+                  <select
+                    value={values[key] ?? ""}
+                    onChange={(event) => setValues((current) => ({ ...current, [key]: event.target.value }))}
+                    className="gaokao-profile-confirm-input"
+                  >
+                    <option value="">待补</option>
+                    <option value="是">可以出省</option>
+                    <option value="否">不出省</option>
+                  </select>
+                ) : (
+                  <input
+                    value={values[key] ?? ""}
+                    inputMode={["score", "fullScore", "rank", "year"].includes(key) ? "numeric" : "text"}
+                    onChange={(event) => setValues((current) => ({ ...current, [key]: event.target.value }))}
+                    className="gaokao-profile-confirm-input"
+                  />
+                )}
+              </label>
+            );
+          })}
+        </div>
+        {pending.sourcePrompt ? (
+          <p className="mt-4 rounded-2xl bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-500">
+            原始输入：{pending.sourcePrompt}
+          </p>
+        ) : null}
+        <div className="mt-4 grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-12 rounded-2xl border border-slate-200 bg-white text-sm font-black text-slate-600"
+          >
+            取消，本次不更新
+          </button>
+          <button
+            type="button"
+            onClick={() => onConfirm(patchFromConfirmedProfileForm(pending.editableKeys, values))}
+            className="h-12 rounded-2xl bg-blue-600 text-sm font-black text-white shadow-lg shadow-blue-500/20"
+          >
+            确认并继续
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StrategySummaryCard({
   summary,
 }: {
@@ -3327,22 +4007,28 @@ function StrategySummaryCard({
   );
 }
 
-function PromptSuggestions({ suggestions }: { suggestions: string[] }) {
-  const items = suggestions.length ? suggestions : FALLBACK_SUGGESTIONS;
+function ProfileTicker({ profile, rankMeta }: { profile: StudentProfile; rankMeta?: RankMeta }) {
+  const items = buildProfileTickerItems(profile, rankMeta);
+  const tickerItems = [...items, ...items];
 
   return (
-    <div className="gaokao-floating-suggestions" aria-label="你可能想问">
-      <div className="flex gap-2 overflow-x-auto px-3 py-2">
-        {items.slice(0, 7).map((suggestion) => (
-          <button
-            key={suggestion}
-            type="button"
-            onClick={() => insertPrompt(suggestion)}
-            className="shrink-0 rounded-xl border border-blue-100 bg-blue-50 px-3.5 py-2 text-sm font-bold text-slate-700"
-          >
-            {suggestion}
-          </button>
-        ))}
+    <div className="gaokao-floating-suggestions" aria-label="当前考生画像" role="status">
+      <div className="gaokao-profile-ticker-mask">
+        <div className="gaokao-profile-ticker-track">
+          {tickerItems.map((item, index) => (
+            <span
+              key={`${item.label}-${index}`}
+              className={`gaokao-profile-chip ${item.missing ? "gaokao-profile-chip-missing" : ""}`}
+              aria-hidden={index >= items.length ? "true" : undefined}
+            >
+              <span className="gaokao-profile-chip-label">{item.label}：</span>
+              <span className="gaokao-profile-chip-value">{item.value}</span>
+            </span>
+          ))}
+        </div>
+        <span className="sr-only">
+          {items.map((item) => `${item.label}：${item.value}`).join("，")}
+        </span>
       </div>
     </div>
   );
@@ -3370,7 +4056,7 @@ function AgentConversationPanel({
             chatDisclaimerText: "重要志愿决策请以省考试院和院校官方数据为准。",
             welcomeMessageText:
               "我是志愿填报 agent，会先聊清楚省份、科类、分数、位次和家庭约束。问分数线时我会先查官方数据，再用图表说话。",
-            modalHeaderTitle: "高考志愿填报 Agent",
+            modalHeaderTitle: "升学策士",
           }}
           input={{
             showDisclaimer: true,
@@ -3387,6 +4073,8 @@ function AgentConversationPanel({
 }
 
 function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) {
+  const minTextareaHeight = 68;
+  const maxTextareaHeight = 112;
   const [draft, setDraft] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -3394,13 +4082,13 @@ function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) 
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-    textarea.style.height = "44px";
-    textarea.style.height = `${Math.min(112, Math.max(44, textarea.scrollHeight))}px`;
+    textarea.style.height = `${minTextareaHeight}px`;
+    textarea.style.height = `${Math.min(maxTextareaHeight, Math.max(minTextareaHeight, textarea.scrollHeight))}px`;
     window.requestAnimationFrame(() => {
       const height = dockRef.current?.getBoundingClientRect().height ?? 88;
       document.documentElement.style.setProperty("--gaokao-composer-height", `${Math.ceil(height)}px`);
     });
-  }, []);
+  }, [maxTextareaHeight, minTextareaHeight]);
 
   useEffect(() => {
     const handleDraft = (event: Event) => {
@@ -3471,8 +4159,8 @@ function TextComposerDock({ onSubmit }: { onSubmit: (prompt: string) => void }) 
               submitDraft();
             }
           }}
-          rows={1}
-          className="max-h-28 min-h-11 flex-1 resize-none overflow-y-auto rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base leading-5 text-slate-900 outline-none placeholder:text-slate-400 focus:border-blue-300 focus:ring-2 focus:ring-blue-100"
+          rows={2}
+          className="max-h-28 min-h-[68px] flex-1 resize-none overflow-y-auto rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base leading-5 text-slate-900 outline-none placeholder:text-slate-400 focus:border-blue-300 focus:ring-2 focus:ring-blue-100"
           placeholder="输入你的位次、目标专业、预算或出省意愿..."
         />
         <button
@@ -3768,7 +4456,7 @@ function AdvisorChatSurface() {
     createNewSession,
   } = useLocalSessions();
   useCompactAdmissionScoreToolGroups(activeSessionId);
-  const { activeProfile, updateProfileFromPatch } = useLocalProfiles(activeSessionId);
+  const { activeProfile, updateProfileFromPatch: applyConfirmedProfilePatch } = useLocalProfiles(activeSessionId);
   const {
     activeSessionSummary,
     activeTurnContext,
@@ -3789,146 +4477,11 @@ function AdvisorChatSurface() {
   const rankHydrationKeyRef = useRef("");
   const manuallySubmittedPromptRef = useRef<{ prompt: string; submittedAt: number } | null>(null);
   const submittingPromptRef = useRef(false);
-  const hydrateRankForTurnContext = useCallback(
-    (sessionId: string, turnContext: TurnContext, lastAssistantText: string) => {
-      if (!canAutoHydrateRank(turnContext.profileAfterTurn)) return;
-      void requestRankHydration(turnContext.profileAfterTurn)
-        .then((rankResult) => {
-          if (!rankResult) return;
-          const nextTurnContext = mergeRankHydrationIntoTurnContext(
-            turnContext,
-            rankResult,
-            lastAssistantText,
-          );
-          updateProfileFromPatch(sessionId, {
-            rank: rankResult.rank,
-            subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
-            updatedAt: nextTurnContext.updatedAt,
-          });
-          upsertRankMeta(sessionId, {
-            year: rankResult.year ?? 2025,
-            source: "auto2025",
-            matchedScore: rankResult.matchedScore,
-            note: rankResult.rankSourceLabel ?? "2025一分一段参考",
-            sourceTitle: rankResult.source?.title,
-          });
-          upsertTurnContext(sessionId, nextTurnContext);
-        })
-        .catch(() => undefined);
-    },
-    [updateProfileFromPatch, upsertRankMeta, upsertTurnContext],
-  );
-  const handlePromptSubmitted = useCallback(
-    (sessionId: string, prompt: string) => {
-      const lastAssistantText = readLastAssistantText();
-      const localTurnContext = buildLocalTurnContext({
-        prompt,
-        profile: activeProfile,
-        previousSummary: activeSessionSummary,
-        lastAssistantText,
-      });
-      const scoreChanged =
-        typeof localTurnContext.profilePatch.score === "number" &&
-        localTurnContext.profilePatch.score !== activeProfile.score &&
-        typeof localTurnContext.profilePatch.rank !== "number";
-      if (scoreChanged) {
-        localTurnContext.profilePatch = { ...localTurnContext.profilePatch, rank: undefined };
-        localTurnContext.profileAfterTurn = { ...localTurnContext.profileAfterTurn, rank: undefined };
-        localTurnContext.toolRoute = routeAgentTurn({
-          userMessage: prompt,
-          profile: localTurnContext.profileAfterTurn as AgentStudentProfile,
-        });
-        clearRankMeta(sessionId);
-      }
-      if (typeof localTurnContext.profilePatch.rank === "number") {
-        upsertRankMeta(sessionId, {
-          year: 2025,
-          source: "user",
-          note: "用户提供位次，择校时对比2025投档/录取数据",
-        });
-      }
-      autoRenameSessionFromPrompt(sessionId, prompt);
-      updateProfileFromPatch(sessionId, localTurnContext.profilePatch);
-      upsertTurnContext(sessionId, localTurnContext);
-      hydrateRankForTurnContext(sessionId, localTurnContext, lastAssistantText);
-
-      if (shouldUseRemotePreprocess(prompt)) {
-        void requestRemotePreprocess({
-          threadId: sessionId,
-          rawPrompt: prompt,
-          profile: mergeProfile(activeProfile, localTurnContext.profilePatch),
-          previousSummary: activeSessionSummary,
-          lastAssistantText,
-        })
-          .then((remote) => {
-            const mergedTurnContext = mergeRemoteTurnContext(localTurnContext, remote, activeProfile);
-            const remoteScoreChanged =
-              typeof mergedTurnContext.profilePatch.score === "number" &&
-              mergedTurnContext.profilePatch.score !== activeProfile.score &&
-              typeof mergedTurnContext.profilePatch.rank !== "number";
-            if (remoteScoreChanged) {
-              mergedTurnContext.profilePatch = { ...mergedTurnContext.profilePatch, rank: undefined };
-              mergedTurnContext.profileAfterTurn = { ...mergedTurnContext.profileAfterTurn, rank: undefined };
-              mergedTurnContext.toolRoute = routeAgentTurn({
-                userMessage: prompt,
-                profile: mergedTurnContext.profileAfterTurn as AgentStudentProfile,
-              });
-              clearRankMeta(sessionId);
-            }
-            if (typeof mergedTurnContext.profilePatch.rank === "number") {
-              upsertRankMeta(sessionId, {
-                year: 2025,
-                source: "user",
-                note: "用户提供位次，择校时对比2025投档/录取数据",
-              });
-            }
-            updateProfileFromPatch(sessionId, mergedTurnContext.profilePatch);
-            upsertTurnContext(sessionId, mergedTurnContext);
-            hydrateRankForTurnContext(sessionId, mergedTurnContext, lastAssistantText);
-          })
-          .catch(() => {
-            upsertTurnContext(sessionId, {
-              ...localTurnContext,
-              ambiguityWarnings: uniqueTextItems([
-                ...localTurnContext.ambiguityWarnings,
-                "远程预处理暂不可用，已使用本地规则画像。",
-              ]),
-            });
-          });
-      }
-    },
-    [
-      activeProfile,
-      activeSessionSummary,
-      autoRenameSessionFromPrompt,
-      clearRankMeta,
-      hydrateRankForTurnContext,
-      updateProfileFromPatch,
-      upsertRankMeta,
-      upsertTurnContext,
-    ],
-  );
-  useAutoSessionTitle(activeSessionId, handlePromptSubmitted, manuallySubmittedPromptRef);
-  const authoritativeProfile = withDerivedProfile(activeTurnContext?.profileAfterTurn ?? activeProfile);
-  const missingFields = prioritizeMissingFields(
-    authoritativeProfile,
-    "",
-    activeTurnContext?.missingPriority,
-    activeIgnoredFields,
-  ).slice(0, 8);
-  const completion = profileCompletion(authoritativeProfile, activeIgnoredFields);
-  const strategySummary = buildStrategySummary(authoritativeProfile, missingFields, activeIgnoredFields);
-  const ignoredSuggestions = new Set(
-    activeIgnoredFields.flatMap((key) => SUGGESTION_TEMPLATE_BY_FIELD[key] ?? []),
-  );
-  const dashboardSuggestions = uniqueTextItems(
-    [...activeSuggestions, ...FALLBACK_SUGGESTIONS].filter((item) => !ignoredSuggestions.has(item)),
-  ).slice(0, 7);
-  const handleSubmitPrompt = useCallback(async (prompt: string) => {
-    if (submittingPromptRef.current) return;
-    submittingPromptRef.current = true;
-    manuallySubmittedPromptRef.current = { prompt, submittedAt: Date.now() };
-    handlePromptSubmitted(activeSessionId, prompt);
+  const assistantProfileSyncRef = useRef("");
+  const profileHomeRef = useRef<HTMLDivElement | null>(null);
+  const [profileDockVisible, setProfileDockVisible] = useState(false);
+  const [pendingProfileConfirmation, setPendingProfileConfirmation] = useState<PendingProfileConfirmation | null>(null);
+  const executeAgentPrompt = useCallback(async (prompt: string) => {
     try {
       const runtimeAgent = await waitForRuntimeAgent(copilotkit, agent);
       if ((runtimeAgent as { isRunning?: boolean }).isRunning) return;
@@ -3953,7 +4506,124 @@ function AdvisorChatSurface() {
         behavior: "smooth",
       });
     }, 120);
-  }, [activeSessionId, agent, copilotkit, handlePromptSubmitted]);
+  }, [agent, copilotkit]);
+
+  const hydrateRankForTurnContext = useCallback(
+    (sessionId: string, turnContext: TurnContext, lastAssistantText: string) => {
+      if (!canAutoHydrateRank(turnContext.profileAfterTurn)) return;
+      void requestRankHydration(turnContext.profileAfterTurn)
+        .then((rankResult) => {
+          if (!rankResult) return;
+          const nextTurnContext = mergeRankHydrationIntoTurnContext(
+            turnContext,
+            rankResult,
+            lastAssistantText,
+          );
+          const rankPatch: Partial<StudentProfile> = {
+            rank: rankResult.rank,
+            subjectTrack: turnContext.profileAfterTurn.subjectTrack || rankResult.subjectTrack,
+            updatedAt: nextTurnContext.updatedAt,
+          };
+          const nextPending = createProfileConfirmation({
+            sessionId,
+            source: "rank_hydration",
+            sourcePrompt: "自动查询 2025 一分一段参考位次",
+            currentProfile: turnContext.profileAfterTurn,
+            proposedPatch: rankPatch,
+            pendingTurnContext: nextTurnContext,
+            rankMeta: {
+              year: rankResult.year ?? 2025,
+              source: "auto2025",
+              matchedScore: rankResult.matchedScore,
+              note: rankResult.rankSourceLabel ?? "2025一分一段参考",
+              sourceTitle: rankResult.source?.title,
+            },
+          });
+          if (nextPending) setPendingProfileConfirmation((current) => current ?? nextPending);
+        })
+        .catch(() => undefined);
+    },
+    [],
+  );
+  const handlePromptSubmitted = useCallback(
+    (sessionId: string, prompt: string) => {
+      const lastAssistantText = readLastAssistantText();
+      const localTurnContext = buildLocalTurnContext({
+        prompt,
+        profile: activeProfile,
+        previousSummary: activeSessionSummary,
+        lastAssistantText,
+      });
+      const scoreChanged =
+        typeof localTurnContext.profilePatch.score === "number" &&
+        localTurnContext.profilePatch.score !== activeProfile.score &&
+        typeof localTurnContext.profilePatch.rank !== "number";
+      if (scoreChanged) {
+        localTurnContext.profilePatch = { ...localTurnContext.profilePatch, rank: undefined };
+        localTurnContext.profileAfterTurn = { ...localTurnContext.profileAfterTurn, rank: undefined };
+        localTurnContext.toolRoute = routeAgentTurn({
+          userMessage: prompt,
+          profile: localTurnContext.profileAfterTurn as AgentStudentProfile,
+        });
+      }
+      autoRenameSessionFromPrompt(sessionId, prompt);
+      const nextPending = createProfileConfirmation({
+        sessionId,
+        source: "user_prompt",
+        sourcePrompt: prompt,
+        currentProfile: activeProfile,
+        proposedPatch: localTurnContext.profilePatch,
+        pendingTurnContext: localTurnContext,
+        runAgentAfterConfirm: true,
+        rankMeta: typeof localTurnContext.profilePatch.rank === "number"
+          ? {
+              year: 2025,
+              source: "user",
+              note: "用户提供位次，择校时对比2025投档/录取数据",
+            }
+          : undefined,
+      });
+      if (nextPending) {
+        setPendingProfileConfirmation(nextPending);
+        return false;
+      }
+      upsertTurnContext(sessionId, localTurnContext);
+      return true;
+    },
+    [
+      activeProfile,
+      activeSessionSummary,
+      autoRenameSessionFromPrompt,
+      upsertTurnContext,
+    ],
+  );
+  useAutoSessionTitle(activeSessionId, handlePromptSubmitted, manuallySubmittedPromptRef);
+  const authoritativeProfile = withDerivedProfile(activeTurnContext?.profileAfterTurn ?? activeProfile);
+  const missingFields = prioritizeMissingFields(
+    authoritativeProfile,
+    "",
+    activeTurnContext?.missingPriority,
+    activeIgnoredFields,
+  ).slice(0, 8);
+  const completion = profileCompletion(authoritativeProfile, activeIgnoredFields);
+  const strategySummary = buildStrategySummary(authoritativeProfile, missingFields, activeIgnoredFields);
+  const ignoredSuggestions = new Set(
+    activeIgnoredFields.flatMap((key) => SUGGESTION_TEMPLATE_BY_FIELD[key] ?? []),
+  );
+  const dashboardSuggestions = uniqueTextItems(
+    [...activeSuggestions, ...FALLBACK_SUGGESTIONS].filter((item) => !ignoredSuggestions.has(item)),
+  ).slice(0, 7);
+  const handleSubmitPrompt = useCallback(async (prompt: string) => {
+    if (submittingPromptRef.current) return;
+    submittingPromptRef.current = true;
+    manuallySubmittedPromptRef.current = { prompt, submittedAt: Date.now() };
+    const shouldRunAgent = handlePromptSubmitted(activeSessionId, prompt);
+    if (!shouldRunAgent) {
+      submittingPromptRef.current = false;
+      return;
+    }
+    await executeAgentPrompt(prompt);
+  }, [activeSessionId, executeAgentPrompt, handlePromptSubmitted]);
 
   useAssistantSuggestionRefresh({
     activeSessionId,
@@ -3998,19 +4668,27 @@ function AdvisorChatSurface() {
           rankResult,
           readLastAssistantText(),
         );
-        updateProfileFromPatch(activeSessionId, {
+        const rankPatch: Partial<StudentProfile> = {
           rank: rankResult.rank,
           subjectTrack: authoritativeProfile.subjectTrack || rankResult.subjectTrack,
           updatedAt: nextTurnContext.updatedAt,
+        };
+        const nextPending = createProfileConfirmation({
+          sessionId: activeSessionId,
+          source: "rank_hydration",
+          sourcePrompt: "自动查询 2025 一分一段参考位次",
+          currentProfile: authoritativeProfile,
+          proposedPatch: rankPatch,
+          pendingTurnContext: nextTurnContext,
+          rankMeta: {
+            year: rankResult.year ?? 2025,
+            source: "auto2025",
+            matchedScore: rankResult.matchedScore,
+            note: rankResult.rankSourceLabel ?? "2025一分一段参考",
+            sourceTitle: rankResult.source?.title,
+          },
         });
-        upsertRankMeta(activeSessionId, {
-          year: rankResult.year ?? 2025,
-          source: "auto2025",
-          matchedScore: rankResult.matchedScore,
-          note: rankResult.rankSourceLabel ?? "2025一分一段参考",
-          sourceTitle: rankResult.source?.title,
-        });
-        upsertTurnContext(activeSessionId, nextTurnContext);
+        if (nextPending) setPendingProfileConfirmation((current) => current ?? nextPending);
       })
       .catch(() => undefined);
   }, [
@@ -4021,16 +4699,97 @@ function AdvisorChatSurface() {
     authoritativeProfile.rank,
     authoritativeProfile.score,
     authoritativeProfile.subjectTrack,
-    updateProfileFromPatch,
-    upsertRankMeta,
-    upsertTurnContext,
+    authoritativeProfile,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const messageList = document.querySelector('[data-testid="copilot-message-list"]');
+    if (!messageList) return;
+
+    let frame = 0;
+    const syncLatestAssistantProfile = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const recentTexts = readRecentAssistantTexts();
+        const candidate = recentTexts
+          .map((text) => ({ text, patch: extractProfileFromPrompt(text) }))
+          .find(({ patch }) => typeof patch.rank === "number") ??
+          recentTexts
+            .map((text) => ({ text, patch: extractProfileFromPrompt(text) }))
+            .find(({ patch }) => typeof patch.score === "number" || patch.province || patch.subjectTrack);
+        if (!candidate?.text || candidate.text === assistantProfileSyncRef.current) return;
+        assistantProfileSyncRef.current = candidate.text;
+
+        const { text: latestText, patch } = candidate;
+        const hasReliablePatch =
+          typeof patch.rank === "number" ||
+          typeof patch.score === "number" ||
+          Boolean(patch.province || patch.subjectTrack);
+        if (!hasReliablePatch) return;
+
+        const proposedPatch = {
+          ...patch,
+          updatedAt: new Date().toISOString(),
+        };
+        const nextProfile = withDerivedProfile(mergeProfile(authoritativeProfile, proposedPatch));
+        const pendingTurnContext = activeTurnContext
+          ? {
+              ...activeTurnContext,
+              profilePatch: mergeProfile(activeTurnContext.profilePatch as StudentProfile, proposedPatch),
+              profileAfterTurn: nextProfile,
+              missingPriority: prioritizeMissingFields(
+                nextProfile,
+                activeTurnContext.rawPrompt,
+                activeTurnContext.missingPriority.filter((key) => key !== "rank"),
+                activeIgnoredFields,
+              ),
+              suggestions: buildSuggestions(nextProfile, activeTurnContext.missingPriority, latestText, activeIgnoredFields),
+              updatedAt: new Date().toISOString(),
+            }
+          : undefined;
+        const nextPending = createProfileConfirmation({
+          sessionId: activeSessionId,
+          source: "assistant_sync",
+          sourcePrompt: latestText,
+          currentProfile: authoritativeProfile,
+          proposedPatch,
+          pendingTurnContext,
+          rankMeta: typeof patch.rank === "number" && /2025|一分一段|参考位次|gaokao-vault/.test(latestText)
+            ? {
+                year: 2025,
+                source: "auto2025",
+                note: "由助手回复中的2025一分一段参考位次同步",
+              }
+            : undefined,
+        });
+        if (nextPending) setPendingProfileConfirmation((current) => current ?? nextPending);
+      });
+    };
+
+    syncLatestAssistantProfile();
+    const observer = new MutationObserver(syncLatestAssistantProfile);
+    observer.observe(messageList, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [
+    activeIgnoredFields,
+    activeSessionId,
+    activeTurnContext,
+    authoritativeProfile,
   ]);
 
   useAgentContext({
     description: "会话边界与全局规则",
     value:
       `thread=${activeSessionId}; ${GAOKAO_STAGE_CONTEXT}` +
-      "当前画像优先于历史聊天；高考省份=投档省份，目标城市=就读偏好。" +
+      "当前画像优先于历史聊天和用户原始提示词；若原始提示词与已确认画像冲突，必须以已确认画像为准；高考省份=投档省份，目标城市=就读偏好。" +
       `rankMeta=${activeRankMeta ? JSON.stringify(activeRankMeta) : "none"}; ` +
       `ignoredMissingFields=${activeIgnoredFields.join(",") || "none"}; ` +
       `router=${activeTurnContext?.toolRoute ? buildAgentRouterContext(activeTurnContext.toolRoute) : "none"}; ` +
@@ -4166,14 +4925,86 @@ function AdvisorChatSurface() {
 
   const handleIgnoreMissing = useCallback(() => {
     setIgnoredFields(activeSessionId, missingFields);
-    const prompt =
-      `忽略这些待补信息：${missingFields.join("、") || "无"}。` +
-      "请直接基于当前画像给出志愿填报意见摘要；明确说明这是信息不完整时的初步参考，并优先使用当前画像和2025投档/位次口径。";
-    handleSubmitPrompt(prompt);
+    handleSubmitPrompt("忽略其他待补信息，直接给我方案。");
   }, [activeSessionId, handleSubmitPrompt, missingFields, setIgnoredFields]);
   const handleRestoreMissing = useCallback(() => {
     clearIgnoredFields(activeSessionId);
   }, [activeSessionId, clearIgnoredFields]);
+
+  const handleConfirmProfilePatch = useCallback((confirmedPatch: Partial<StudentProfile>) => {
+    const pending = pendingProfileConfirmation;
+    if (!pending) return;
+    const confirmedProfile = withDerivedProfile(mergeProfile(pending.currentProfile, confirmedPatch));
+    applyConfirmedProfilePatch(pending.sessionId, confirmedPatch);
+    if (typeof confirmedPatch.score === "number" && typeof confirmedPatch.rank !== "number") {
+      clearRankMeta(pending.sessionId);
+    }
+    if (pending.rankMeta) {
+      upsertRankMeta(pending.sessionId, pending.rankMeta);
+    } else if (typeof confirmedPatch.rank === "number") {
+      upsertRankMeta(pending.sessionId, {
+        year: 2025,
+        source: pending.source === "rank_hydration" ? "auto2025" : "user",
+        note: pending.source === "rank_hydration" ? "2025一分一段参考" : "用户确认位次",
+      });
+    }
+
+    const nextTurnContext = buildConfirmedTurnContext({
+      prompt: pending.pendingTurnContext?.rawPrompt || pending.sourcePrompt,
+      confirmedPatch,
+      confirmedProfile,
+      previousSummary: activeSessionSummary,
+      lastAssistantText: readLastAssistantText(),
+      previousMissingPriority: pending.pendingTurnContext?.missingPriority ?? activeTurnContext?.missingPriority,
+    });
+    upsertTurnContext(pending.sessionId, nextTurnContext);
+    setPendingProfileConfirmation(null);
+
+    if (pending.runAgentAfterConfirm) {
+      void executeAgentPrompt(pending.sourcePrompt);
+    }
+  }, [
+    activeSessionSummary,
+    activeTurnContext?.missingPriority,
+    applyConfirmedProfilePatch,
+    clearRankMeta,
+    executeAgentPrompt,
+    pendingProfileConfirmation,
+    upsertRankMeta,
+    upsertTurnContext,
+  ]);
+
+  const handleCancelProfileConfirmation = useCallback(() => {
+    setPendingProfileConfirmation(null);
+    submittingPromptRef.current = false;
+  }, []);
+
+  useEffect(() => {
+    const scrollRoot = dashboardScrollRef.current;
+    if (!scrollRoot) return;
+
+    let frame = 0;
+    const updateProfileDock = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const card = profileHomeRef.current;
+        if (!card) return;
+        const rootRect = scrollRoot.getBoundingClientRect();
+        const cardRect = card.getBoundingClientRect();
+        const shouldShowDock = cardRect.bottom <= rootRect.top + 8;
+        setProfileDockVisible((current) => (current === shouldShowDock ? current : shouldShowDock));
+      });
+    };
+
+    updateProfileDock();
+    scrollRoot.addEventListener("scroll", updateProfileDock, { passive: true });
+    window.addEventListener("resize", updateProfileDock);
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      scrollRoot.removeEventListener("scroll", updateProfileDock);
+      window.removeEventListener("resize", updateProfileDock);
+    };
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -4189,11 +5020,13 @@ function AdvisorChatSurface() {
       const now = Date.now();
       if (now - lastScrollAt < 180) return;
       lastScrollAt = now;
+      const distanceFromBottom = scrollRoot.scrollHeight - scrollRoot.clientHeight - scrollRoot.scrollTop;
+      if (distanceFromBottom > 160) return;
       if (frame) window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         scrollRoot.scrollTo({
           top: scrollRoot.scrollHeight,
-          behavior: "auto",
+          behavior: "smooth",
         });
       });
     };
@@ -4212,23 +5045,72 @@ function AdvisorChatSurface() {
   }, [activeSessionId]);
 
   return (
-    <div className="gaokao-agent-shell mx-auto flex h-dvh min-h-0 w-full max-w-[480px] flex-col overflow-hidden bg-[#f6f9ff] text-slate-950 shadow-2xl shadow-slate-200/70">
-      <main ref={dashboardScrollRef} className="gaokao-dashboard-scroll min-h-0 flex-1 overflow-y-auto pb-52">
+    <div
+      className={`gaokao-agent-shell mx-auto flex h-dvh min-h-0 w-full max-w-[480px] flex-col overflow-hidden bg-[#f6f9ff] text-slate-950 shadow-2xl shadow-slate-200/70 ${profileDockVisible || activeProfilePanelCollapsed ? "gaokao-profile-docked" : ""}`}
+    >
+      <div className={`gaokao-profile-dock ${profileDockVisible || activeProfilePanelCollapsed ? "gaokao-profile-dock-visible" : ""}`}>
+        <CandidateProfileCard
+          profile={authoritativeProfile}
+          completion={completion}
+          missingCount={missingFields.length}
+          missingFields={missingFields}
+          ignoredCount={activeIgnoredFields.length}
+          isCollapsed
+          rankMeta={activeRankMeta}
+          strategySummary={strategySummary}
+          onToggleCollapsed={() => undefined}
+          onExpandCollapsed={() => {
+            setProfilePanelCollapsed(activeSessionId, false);
+            setProfileDockVisible(false);
+            window.requestAnimationFrame(() => {
+              dashboardScrollRef.current?.scrollTo({
+                top: 0,
+                behavior: "auto",
+              });
+            });
+          }}
+          onIgnoreMissing={handleIgnoreMissing}
+          onRestoreMissing={handleRestoreMissing}
+        />
+      </div>
+      {pendingProfileConfirmation ? (
+        <ProfileConfirmationModal
+          pending={pendingProfileConfirmation}
+          onConfirm={handleConfirmProfilePatch}
+          onCancel={handleCancelProfileConfirmation}
+        />
+      ) : null}
+      <main ref={dashboardScrollRef} className="gaokao-dashboard-scroll min-h-0 flex-1 overflow-y-auto pb-80">
+        <div className="gaokao-profile-dock-spacer" aria-hidden="true" />
         <AppHeader onCreate={createNewSession} onExport={handleExportReport} />
         <div className="grid gap-4">
-          <CandidateProfileCard
-            profile={authoritativeProfile}
-            completion={completion}
-            missingCount={missingFields.length}
-            missingFields={missingFields}
-            ignoredCount={activeIgnoredFields.length}
-            isCollapsed={activeProfilePanelCollapsed}
-            rankMeta={activeRankMeta}
-            strategySummary={strategySummary}
-            onToggleCollapsed={() => setProfilePanelCollapsed(activeSessionId, !activeProfilePanelCollapsed)}
-            onIgnoreMissing={handleIgnoreMissing}
-            onRestoreMissing={handleRestoreMissing}
-          />
+          <div ref={profileHomeRef}>
+            <CandidateProfileCard
+              profile={authoritativeProfile}
+              completion={completion}
+              missingCount={missingFields.length}
+              missingFields={missingFields}
+              ignoredCount={activeIgnoredFields.length}
+              isCollapsed={false}
+              rankMeta={activeRankMeta}
+              strategySummary={strategySummary}
+              onToggleCollapsed={() => {
+                setProfilePanelCollapsed(activeSessionId, true);
+                setProfileDockVisible(true);
+                const scrollRoot = dashboardScrollRef.current;
+                const nextTop = profileHomeRef.current
+                  ? profileHomeRef.current.offsetTop + profileHomeRef.current.offsetHeight
+                  : 360;
+                scrollRoot?.scrollTo({
+                  top: nextTop,
+                  behavior: "smooth",
+                });
+              }}
+              onExpandCollapsed={() => undefined}
+              onIgnoreMissing={handleIgnoreMissing}
+              onRestoreMissing={handleRestoreMissing}
+            />
+          </div>
           <AgentConversationPanel
             activeSessionId={activeSessionId}
             activeSuggestions={activeSuggestions}
@@ -4237,7 +5119,7 @@ function AdvisorChatSurface() {
         </div>
       </main>
 
-      <PromptSuggestions suggestions={dashboardSuggestions} />
+      <ProfileTicker profile={authoritativeProfile} rankMeta={activeRankMeta} />
       <TextComposerDock onSubmit={handleSubmitPrompt} />
     </div>
   );

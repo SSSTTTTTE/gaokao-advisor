@@ -5,6 +5,7 @@ export type StudentProfile = {
   year?: number;
   subjectTrack?: string;
   score?: number;
+  fullScore?: number;
   rank?: number;
   targetCities?: string[];
   preferredMajors?: string[];

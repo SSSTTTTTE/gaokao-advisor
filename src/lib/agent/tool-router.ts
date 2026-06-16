@@ -189,12 +189,16 @@ function completeDecision(args: {
 export function routeAgentTurn({
   userMessage,
   profile,
+  trustProfile = false,
 }: {
   userMessage: string;
   profile?: StudentProfile;
+  trustProfile?: boolean;
 }): RouterDecision {
-  const profilePatch = extractStudentProfilePatch(userMessage);
-  const mergedProfile = withDerivedStudentProfile(mergeStudentProfile(profile, profilePatch));
+  const profilePatch = trustProfile ? {} : extractStudentProfilePatch(userMessage);
+  const mergedProfile = trustProfile
+    ? withDerivedStudentProfile(profile)
+    : withDerivedStudentProfile(mergeStudentProfile(profile, profilePatch));
 
   const schools = extractSchools(userMessage);
   const majors = extractMajorItems(userMessage);

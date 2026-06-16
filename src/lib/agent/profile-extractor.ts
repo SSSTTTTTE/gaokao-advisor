@@ -120,7 +120,7 @@ function hasExamProvinceContext(text: string, candidate: string) {
   const after = text.slice(index + candidate.length, index + candidate.length + 12);
   return (
     /(高考省份(?:是|为)?|考试省份(?:是|为)?|生源地(?:是|为)?|考籍(?:是|为)?|学籍(?:是|为)?|户籍(?:是|为)?|我在|我是|来自|本省|省份(?:是|为)?|高考在|在)$/.test(before) ||
-    /^(考生|高考|物理|历史|理科|文科|选科|综合|位次|排名|分|全省)/.test(after)
+    /^(20\d{2}|考了|考|考生|高考|物理|历史|理科|文科|选科|综合|位次|排名|分|全省)/.test(after)
   );
 }
 
@@ -288,6 +288,7 @@ export function buildProfileKeyFacts(patch: Partial<StudentProfile>, prompt: str
   if (patch.year) facts.push(`年份：${patch.year}`);
   if (patch.subjectTrack) facts.push(`科类：${patch.subjectTrack}`);
   if (typeof patch.score === "number") facts.push(`分数：${patch.score}`);
+  if (typeof patch.fullScore === "number") facts.push(`满分：${patch.fullScore}`);
   if (typeof patch.rank === "number") facts.push(`位次：${patch.rank}`);
   if (patch.targetCities?.length || patch.cityPreference) facts.push(`目标城市：${patch.targetCities?.join("、") ?? patch.cityPreference}`);
   if (patch.preferredMajors?.length || patch.majorPreference?.length) facts.push(`专业偏好：${(patch.preferredMajors ?? patch.majorPreference)?.join("、")}`);

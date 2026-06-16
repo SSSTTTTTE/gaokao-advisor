@@ -45,6 +45,7 @@ body {
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
   scroll-behavior: smooth;
+  scroll-padding-top: 0.75rem;
 }
 
 .gaokao-dashboard-scroll::-webkit-scrollbar {
@@ -54,6 +55,454 @@ body {
 .gaokao-dashboard-scroll section.mx-4 {
   width: min(448px, calc(100vw - 32px));
   max-width: min(448px, calc(100vw - 32px));
+}
+
+.gaokao-profile-card {
+  overflow: hidden;
+  transform-origin: top center;
+  transition:
+    transform 220ms ease,
+    box-shadow 220ms ease,
+    background-color 220ms ease;
+}
+
+.gaokao-profile-dock {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 0.65rem);
+  left: 50%;
+  width: min(480px, 100vw);
+  z-index: 76;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, calc(-100% - 1rem));
+  transition:
+    opacity 180ms ease,
+    transform 260ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+}
+
+.gaokao-profile-dock-visible {
+  pointer-events: auto;
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.gaokao-profile-dock-spacer {
+  height: 0;
+  transition: height 220ms ease;
+}
+
+.gaokao-profile-docked .gaokao-dashboard-scroll {
+  scroll-padding-top: calc(env(safe-area-inset-top, 0px) + 212px);
+}
+
+.gaokao-profile-card-compact {
+  z-index: 1;
+}
+
+.gaokao-sticky-summary {
+  display: grid;
+  width: calc(100% - 24px);
+  max-width: 456px;
+  min-height: 148px;
+  margin: 0 12px;
+  align-items: center;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "icon score action"
+    "info info info";
+  row-gap: 12px;
+  border: 1px solid #d8e8ff;
+  border-radius: 24px;
+  background: linear-gradient(135deg, #ffffff 0%, #f7fbff 100%);
+  padding: 16px 16px 14px;
+  box-shadow: 0 12px 32px rgb(32 93 180 / 0.1);
+}
+
+.gaokao-sticky-summary-icon-area {
+  grid-area: icon;
+  display: flex;
+  width: 46px;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+
+.gaokao-sticky-summary-icon {
+  display: flex;
+  width: 42px;
+  height: 42px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: #eef5ff;
+  color: #2563eb;
+}
+
+.gaokao-sticky-summary-score-area {
+  grid-area: score;
+  width: auto;
+  min-width: 0;
+  margin-left: 10px;
+}
+
+.gaokao-sticky-summary-title {
+  margin: 0;
+  color: #50617d;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.gaokao-sticky-summary-score {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 2px;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+.gaokao-sticky-summary-score .gaokao-score-roll {
+  color: #2563eb;
+  font-size: 40px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.gaokao-sticky-summary-full-score {
+  color: #71809a;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.gaokao-sticky-summary-badge {
+  display: inline-flex;
+  max-width: 100%;
+  height: 28px;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: #eef5ff;
+  padding: 0 10px;
+  color: #2563eb;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.gaokao-sticky-summary-divider {
+  display: none;
+}
+
+.gaokao-sticky-summary-info-area {
+  grid-area: info;
+  display: flex;
+  min-width: 0;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  border-top: 1px solid #e6eef9;
+  padding-top: 12px;
+}
+
+.gaokao-sticky-summary-info-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  color: #50617d;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.gaokao-sticky-summary-info-row svg {
+  flex: 0 0 auto;
+  color: #7b8daa;
+}
+
+.gaokao-sticky-summary-info-row strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+}
+
+.gaokao-sticky-summary-dashed {
+  display: none;
+}
+
+.gaokao-sticky-summary-progress-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: min(100%, 220px);
+  flex: 1 1 220px;
+  color: #50617d;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.15;
+}
+
+.gaokao-sticky-summary-progress-row strong {
+  color: #2563eb;
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.gaokao-sticky-summary-progress-track {
+  flex: 1 1 80px;
+  width: 100%;
+  max-width: none;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dce6f1;
+}
+
+.gaokao-sticky-summary-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #2563eb;
+}
+
+.gaokao-sticky-summary-action-area {
+  grid-area: action;
+  display: flex;
+  width: auto;
+  height: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: 12px;
+}
+
+.gaokao-sticky-summary-action-button {
+  display: inline-flex;
+  width: auto;
+  min-width: 98px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 1px solid #9ec2ff;
+  border-radius: 999px;
+  background: #f6faff;
+  color: #2563eb;
+  padding: 0 14px;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.gaokao-sticky-summary-action-button:hover,
+.gaokao-sticky-summary-action-button:active {
+  background: #eaf2ff;
+}
+
+.gaokao-sticky-summary-action-button:active {
+  transform: scale(0.98);
+}
+
+.gaokao-profile-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgb(15 23 42 / 0.38);
+  padding: 16px;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+}
+
+.gaokao-profile-confirm-modal {
+  width: min(448px, 100%);
+  max-height: min(78vh, 720px);
+  overflow-y: auto;
+  border: 1px solid #dbeafe;
+  border-radius: 26px;
+  background: #ffffff;
+  padding: 18px;
+  box-shadow: 0 28px 80px rgb(15 23 42 / 0.26);
+}
+
+.gaokao-profile-confirm-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(128px, 42%);
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #e2e8f0;
+  border-radius: 18px;
+  background: #f8fbff;
+  padding: 12px;
+}
+
+.gaokao-profile-confirm-input {
+  min-width: 0;
+  height: 42px;
+  border: 1px solid #bfdbfe;
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 0 12px;
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 800;
+  outline: none;
+}
+
+.gaokao-profile-confirm-input:focus {
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgb(147 197 253 / 0.28);
+}
+
+@media (min-width: 520px) {
+  .gaokao-sticky-summary {
+    display: flex;
+    width: calc(100% - 32px);
+    max-width: 448px;
+    min-height: 128px;
+    margin: 0 16px;
+    padding: 18px 20px;
+  }
+
+  .gaokao-sticky-summary-icon-area {
+    width: 64px;
+    height: 100%;
+    flex-basis: 64px;
+  }
+
+  .gaokao-sticky-summary-icon {
+    width: 52px;
+    height: 52px;
+  }
+
+  .gaokao-sticky-summary-score-area {
+    width: 132px;
+    margin-left: 16px;
+    flex-basis: 132px;
+  }
+
+  .gaokao-sticky-summary-score .gaokao-score-roll {
+    font-size: 44px;
+  }
+
+  .gaokao-sticky-summary-full-score {
+    font-size: 20px;
+  }
+
+  .gaokao-sticky-summary-badge {
+    height: 32px;
+    font-size: 14px;
+  }
+
+  .gaokao-sticky-summary-divider {
+    display: block;
+    width: 1px;
+    height: 78px;
+    flex: 0 0 1px;
+    margin: 0 16px;
+    background: #dbe6f5;
+  }
+
+  .gaokao-sticky-summary-info-area {
+    flex: 1 1 auto;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 6px;
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  .gaokao-sticky-summary-dashed {
+    display: block;
+    width: min(100%, 180px);
+    border-top: 1px dashed #dbe6f5;
+  }
+
+  .gaokao-sticky-summary-progress-row {
+    display: grid;
+    grid-template-columns: max-content 14px max-content minmax(54px, 1fr);
+    min-width: 0;
+    flex: initial;
+  }
+
+  .gaokao-sticky-summary-action-area {
+    width: 112px;
+    flex-basis: 112px;
+    margin-left: 12px;
+  }
+
+  .gaokao-sticky-summary-action-button {
+    width: 108px;
+    font-size: 14px;
+  }
+}
+
+.gaokao-score-roll,
+.gaokao-rank-roll {
+  font-variant-numeric: tabular-nums;
+  transition:
+    color 180ms ease,
+    transform 180ms ease;
+}
+
+.gaokao-profile-progress {
+  position: relative;
+  overflow: hidden;
+  min-width: 0.35rem;
+  transition: width 720ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.gaokao-profile-progress::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+  transform: translateX(-120%);
+  animation: gaokao-progress-shimmer 980ms ease-out;
+}
+
+.gaokao-profile-flash {
+  animation: gaokao-profile-flash 920ms ease-out;
+}
+
+.gaokao-profile-flash .gaokao-score-roll,
+.gaokao-profile-flash .gaokao-rank-roll {
+  transform: translateY(-1px);
+}
+
+@keyframes gaokao-progress-shimmer {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(120%);
+  }
+}
+
+@keyframes gaokao-profile-flash {
+  0% {
+    background-color: #ffffff;
+    box-shadow: 0 14px 32px rgb(15 23 42 / 0.07);
+  }
+  18% {
+    background-color: #eff6ff;
+    box-shadow: 0 20px 48px rgb(37 99 235 / 0.18);
+  }
+  100% {
+    background-color: #ffffff;
+    box-shadow: 0 14px 32px rgb(15 23 42 / 0.07);
+  }
 }
 
 .gaokao-text-composer {
@@ -81,6 +530,89 @@ body {
   background: rgb(255 255 255 / 0.96);
   box-shadow: 0 14px 32px rgb(15 23 42 / 0.09);
   transition: bottom 160ms ease-out;
+}
+
+.gaokao-profile-ticker-mask {
+  overflow: hidden;
+  padding: 0.5rem 0;
+  mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+}
+
+.gaokao-profile-ticker-track {
+  display: flex;
+  width: max-content;
+  gap: 0.5rem;
+  padding-inline: 0.75rem;
+  animation: gaokao-profile-ticker 28s linear infinite;
+  will-change: transform;
+}
+
+.gaokao-profile-chip {
+  display: inline-flex;
+  min-width: max-content;
+  align-items: center;
+  gap: 0.125rem;
+  border: 1px solid #bfdbfe;
+  border-radius: 0.875rem;
+  background: #eff6ff;
+  padding: 0.55rem 0.75rem;
+  color: #0f172a;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.72);
+  white-space: nowrap;
+}
+
+.gaokao-profile-chip-label {
+  font-size: 0.875rem;
+  font-weight: 800;
+  color: #1d4ed8;
+}
+
+.gaokao-profile-chip-value {
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.875rem;
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.gaokao-profile-chip-missing {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+}
+
+.gaokao-profile-chip-missing .gaokao-profile-chip-label,
+.gaokao-profile-chip-missing .gaokao-profile-chip-value {
+  color: #64748b;
+}
+
+@keyframes gaokao-profile-ticker {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(calc(-50% - 0.25rem));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gaokao-profile-ticker-track {
+    animation: none;
+    overflow-x: auto;
+  }
+
+  .gaokao-profile-card,
+  .gaokao-profile-dock,
+  .gaokao-profile-progress,
+  .gaokao-score-roll,
+  .gaokao-rank-roll {
+    transition: none !important;
+  }
+
+  .gaokao-profile-flash,
+  .gaokao-profile-progress::after {
+    animation: none !important;
+  }
 }
 
 .gaokao-chat {
@@ -154,6 +686,30 @@ body {
   padding-inline: 0 !important;
   position: relative;
   z-index: 1;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* flex 列布局下防止子元素被压缩 */
+.gaokao-chat [data-testid="copilot-assistant-message"] > * {
+  flex-shrink: 0 !important;
+  min-width: 0 !important;
+}
+
+/* 问询卡片始终排列在消息最下方 — 直接子元素 */
+.gaokao-chat [data-testid="copilot-assistant-message"] > .gaokao-followup-options,
+.gaokao-chat [data-testid="copilot-assistant-message"] > .gaokao-inline-followup-options,
+.gaokao-chat [data-testid="copilot-assistant-message"] > [data-followup-instance],
+.gaokao-chat [data-testid="copilot-assistant-message"] > [data-gaokao-inline-followup] {
+  order: 9999 !important;
+}
+
+/* 问询卡片始终排列在消息最下方 — 包裹在 wrapper 里的情况 */
+.gaokao-chat [data-testid="copilot-assistant-message"] > :has(> .gaokao-followup-options),
+.gaokao-chat [data-testid="copilot-assistant-message"] > :has(> .gaokao-inline-followup-options),
+.gaokao-chat [data-testid="copilot-assistant-message"] > :has(> [data-followup-instance]),
+.gaokao-chat [data-testid="copilot-assistant-message"] > :has(> [data-gaokao-inline-followup]) {
+  order: 9999 !important;
 }
 
 .gaokao-chat [data-testid="copilot-user-message"] {
